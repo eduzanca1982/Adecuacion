@@ -3,3 +3,4 @@ google-generativeai
 python-docx
 pandas
 gspread
+PyPDF2
