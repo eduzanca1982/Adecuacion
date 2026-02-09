@@ -1,68 +1,103 @@
 import streamlit as st
 import google.generativeai as genai
+import pandas as pd
 from docx import Document
+from docx.shared import Pt
 import io
 
-# 1. Configuración de página e interfaz
-st.set_page_config(page_title="Motor de Adecuación Pedagógica", layout="centered")
-st.title("Adaptación Automática de Contenidos")
-st.write("Carga un examen en .docx y selecciona la dificultad del alumno.")
-
-# 2. Configuración de Gemini
-# Los secretos se cargan desde la nube de Streamlit una vez publicado
+# 1. Configuración de API con modelo estable
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    model = genai.GenerativeModel('gemini-1.5-flash')
-except:
-    st.error("Falta la configuración de la API Key en los secretos.")
+    # Cambio a versión estable para evitar el error 404
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+except Exception as e:
+    st.error("Error de configuración de API.")
 
-# 3. Selector de diagnósticos
-opciones_diagnostico = [
-    "Dislexia",
-    "Discalculia",
-    "Disgrafía",
-    "TDAH",
-    "Dificultad General"
-]
-diagnostico = st.selectbox("Seleccione el diagnóstico del alumno:", opciones_diagnostico)
+# 2. Configuración de Google Sheets
+SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
-# 4. Carga de archivo
-uploaded_file = st.file_uploader("Subir examen original (.docx)", type="docx")
+@st.cache_data(ttl=60)
+def cargar_alumnos():
+    return pd.read_csv(SHEET_URL)
 
-def leer_docx(file):
-    doc = Document(file)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-if uploaded_file is not None:
-    texto_original = leer_docx(uploaded_file)
+def crear_docx_adecuado(texto_ia, diagnostico):
+    doc = Document()
+    style = doc.styles['Normal']
+    font = style.font
     
-    if st.button("Generar Adecuación"):
-        with st.spinner("Gemini está procesando la adecuación..."):
-            
-            # System Prompt con tus instrucciones específicas
-            prompt_sistema = f"""
-            Eres un experto en psicopedagogía de primaria. Tu tarea es recibir un examen y devolverlo 
-            re-escrito con adecuaciones para un alumno con {diagnostico}.
-            
-            REGLAS SEGÚN DIAGNÓSTICO:
-            - Si es Dislexia: Usa frases cortas, interlineado amplio (simulado con espacios), resalta verbos en negrita, simplifica vocabulario técnico.
-            - Si es Discalculia: Desglosa problemas en listas de pasos, sugiere apoyos visuales, usa cuadrículas.
-            - Si es Disgrafía: Transforma desarrollo en opción múltiple o completar huecos.
-            - Si es TDAH: Una consigna por oración. Fragmenta la tarea. Elimina decoraciones.
-            - Si es Dificultad General: Jerarquiza con negritas, incluye un ejemplo resuelto (Ejercicio 0).
+    # Aplicación de reglas de formato según diagnóstico
+    if "Dislexia" in str(diagnostico):
+        font.name = 'Arial'
+        font.size = Pt(12)
+        style.paragraph_format.line_spacing = 1.5 # Interlineado 1.5
+    else:
+        font.name = 'Verdana'
+        font.size = Pt(11)
+        style.paragraph_format.line_spacing = 1.15
 
-            TEXTO ORIGINAL A ADAPTAR:
-            {texto_original}
-            
-            Devuelve el contenido listo para copiar y pegar, manteniendo la estructura de examen.
-            """
+    for linea in texto_ia.split('\n'):
+        if linea.strip():
+            p = doc.add_paragraph()
+            # Procesar negritas de Markdown a Word
+            partes = linea.split("**")
+            for i, parte in enumerate(partes):
+                run = p.add_run(parte)
+                if i % 2 != 0:
+                    run.bold = True
+    
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio
 
-            try:
-                response = model.generate_content(prompt_sistema)
-                st.subheader(f"Examen adecuado para: {diagnostico}")
-                st.markdown(response.text)
-                
-                # Opción para copiar/descargar el texto
-                st.download_button("Descargar resultado como TXT", response.text, file_name="examen_adecuado.txt")
-            except Exception as e:
-                st.error(f"Error al procesar: {e}")
+# 3. Interfaz
+st.title("Adaptación de Contenidos v2.0")
+
+try:
+    df = cargar_alumnos()
+    alumno_selec = st.selectbox("Alumno:", df["Nombre y apellido del alumno"].unique())
+    
+    # Extraer datos del registro
+    datos = df[df["Nombre y apellido del alumno"] == alumno_selec].iloc[-1]
+    grupo = datos["Los grupos base se categorizan según su autonomía y dinámica de trabajo."]
+    emergente = datos["Casos emergentes: alumnos con dificultades específicas que necesitan un acompañamiento personalizado para aprender con éxito."]
+
+    st.info(f"Dificultad detectada: {emergente}")
+
+    uploaded_file = st.file_uploader("Subir examen .docx", type="docx")
+
+    if uploaded_file and st.button("Procesar Adecuación"):
+        # Leer archivo original
+        doc_orig = Document(uploaded_file)
+        texto_orig = "\n".join([p.text for p in doc_orig.paragraphs])
+
+        # Prompt con instrucciones de adecuación
+        prompt = f"""
+        Re-escribe este examen para el alumno {alumno_selec}.
+        Grupo: {grupo}
+        Dificultad: {emergente}
+        
+        Instrucciones:
+        - Si es Dislexia: Usa frases cortas y resalta verbos en negrita.
+        - Si es Discalculia: Desglosa problemas y usa listas de datos.
+        - Si es TDAH: Una consigna por oración y elimina ruido visual.
+        - Si es Grupo A: Aumenta el andamiaje docente.
+        
+        Examen:
+        {texto_orig}
+        """
+
+        with st.spinner("Generando archivo..."):
+            response = model.generate_content(prompt)
+            docx_file = crear_docx_adecuado(response.text, emergente)
+
+            st.download_button(
+                label="Descargar Examen en Word",
+                data=docx_file,
+                file_name=f"Examen_{alumno_selec}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+
+except Exception as e:
+    st.error(f"Error técnico: {e}")
