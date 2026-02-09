@@ -5,10 +5,11 @@ from docx import Document
 from docx.shared import Pt
 import io
 
-# 1. Configuración de API
+# 1. Configuración de API con nombre de modelo estándar
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    # Cambiamos a 'gemini-1.5-flash' que es el nombre más compatible
+    model = genai.GenerativeModel('gemini-1.5-flash')
 except Exception as e:
     st.error("Error de configuración de API.")
 
@@ -19,7 +20,6 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=cs
 @st.cache_data(ttl=60)
 def cargar_alumnos():
     df = pd.read_csv(SHEET_URL)
-    # Limpieza básica de nombres de columnas
     df.columns = [c.strip() for c in df.columns]
     return df
 
@@ -28,7 +28,6 @@ def crear_docx_adecuado(texto_ia, diagnostico):
     style = doc.styles['Normal']
     font = style.font
     
-    # Lógica de formato por diagnóstico
     diag_str = str(diagnostico).lower()
     if "dislexia" in diag_str:
         font.name = 'Arial'
@@ -54,13 +53,12 @@ def crear_docx_adecuado(texto_ia, diagnostico):
     return bio
 
 # 3. Interfaz
-st.title("Adaptación de Contenidos v2.1")
+st.title("Adaptación de Contenidos v2.2")
 
 try:
     df = cargar_alumnos()
     
-    # Mapeo dinámico de columnas por posición para evitar errores de texto largo
-    # Columna 2: Nombre, Columna 3: Grupo, Columna 4: Emergente (ajustar si varía)
+    # Índices de columnas basados en tu planilla
     col_nombre = df.columns[2]
     col_grupo = df.columns[3]
     col_emergente = df.columns[4]
@@ -75,36 +73,47 @@ try:
 
     uploaded_file = st.file_uploader("Subir examen .docx", type="docx")
 
-    if uploaded_file and st.button("Procesar Adecuación"):
-        doc_orig = Document(uploaded_file)
-        texto_orig = "\n".join([p.text for p in doc_orig.paragraphs])
+    if uploaded_file:
+        if st.button("Generar Adecuación"):
+            # Leer texto del Word original
+            doc_orig = Document(uploaded_file)
+            texto_orig = "\n".join([p.text for p in doc_orig.paragraphs])
 
-        prompt = f"""
-        Re-escribe este examen para el alumno {alumno_selec}.
-        Grupo: {grupo}
-        Dificultad: {emergente}
-        
-        Instrucciones:
-        - Si es Dislexia: Usa frases cortas y resalta verbos en negrita.
-        - Si es Discalculia: Desglosa problemas y usa listas de datos.
-        - Si es TDAH: Una consigna por oración y elimina ruido visual.
-        - Si es Grupo A: Aumenta el andamiaje docente.
-        - No incluyas saludos ni introducciones, solo el examen.
+            prompt = f"""
+            Eres un experto en psicopedagogía. Tu tarea es adaptar el examen adjunto.
+            ALUMNO: {alumno_selec}
+            GRUPO: {grupo}
+            DIAGNÓSTICO: {emergente}
+            
+            INSTRUCCIONES DE ADAPTACIÓN:
+            1. Si tiene Dislexia: Usa frases cortas, resalta verbos en negrita, simplifica vocabulario.
+            2. Si tiene Discalculia: Desglosa problemas en pasos, usa viñetas, deja espacio para cálculos.
+            3. Si es Grupo A: Reduce carga cognitiva y aumenta el andamiaje.
+            4. No incluyas introducciones ni despedidas.
+            
+            EXAMEN A ADAPTAR:
+            {texto_orig}
+            """
 
-        Examen:
-        {texto_orig}
-        """
+            try:
+                with st.spinner("Procesando con Gemini..."):
+                    # Llamada directa al método de generación
+                    response = model.generate_content(prompt)
+                    
+                    if response.text:
+                        st.success("¡Adecuación generada con éxito!")
+                        docx_file = crear_docx_adecuado(response.text, emergente)
 
-        with st.spinner("Generando archivo..."):
-            response = model.generate_content(prompt)
-            docx_file = crear_docx_adecuado(response.text, emergente)
-
-            st.download_button(
-                label="Descargar Examen en Word",
-                data=docx_file,
-                file_name=f"Examen_{alumno_selec}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+                        st.download_button(
+                            label="⬇️ Descargar Examen Adaptado (.docx)",
+                            data=docx_file,
+                            file_name=f"Examen_Adaptado_{alumno_selec}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                    else:
+                        st.error("La IA no devolvió contenido.")
+            except Exception as api_err:
+                st.error(f"Error en la API de Google: {api_err}")
 
 except Exception as e:
-    st.error(f"Error al leer la planilla. Verifica que las columnas coincidan. Detalle: {e}")
+    st.error(f"Error en la aplicación: {e}")
