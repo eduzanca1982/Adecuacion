@@ -1,4 +1,3 @@
-Plaintext
 streamlit
 google-generativeai
 python-docx
