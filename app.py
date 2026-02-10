@@ -11,8 +11,8 @@ import random
 import re
 import unicodedata
 
-# 1. CONFIGURACIÓN Y UTILIDADES (Robustez ChatGPT)
-st.set_page_config(page_title="Motor Pedagógico v10 🚀", layout="wide")
+# 1. CONFIGURACIÓN Y ROBUSTEZ
+st.set_page_config(page_title="Motor Pedagógico v10.2 🚀", layout="wide")
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 
 def nrm(s: str) -> str:
@@ -22,45 +22,47 @@ def nrm(s: str) -> str:
     return s.lower()
 
 def with_backoff(call, max_tries=6):
-    """Reintento exponencial ante errores de cuota 429."""
     for attempt in range(max_tries):
         try:
             return call()
         except Exception as e:
             if "429" in str(e) and attempt < max_tries - 1:
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(wait)
+                time.sleep((2 ** attempt) + random.uniform(0, 1))
                 continue
             raise e
 
-# 2. PROMPT MAESTRO (Identidad Pedagógica Reforzada)
+# 2. INICIALIZACIÓN DINÁMICA (Adiós al 404)
+try:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    modelos_disponibles = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    MODELO_TEXTO = next((m for m in modelos_disponibles if "gemini-1.5-flash" in m), modelos_disponibles[0])
+    MODELO_IMG = next((m for m in modelos_disponibles if "imagen" in m), None)
+except Exception as e:
+    st.error(f"Error de conexión: {e}")
+    st.stop()
+
+# 3. PROMPT MAESTRO
 SYSTEM_PROMPT = """Eres un Diseñador Editorial para Inclusión Escolar. 
-Tu tarea es ADECUAR el examen original de forma empática y clara.
+1. TRANSCRIBE: Copia cada ejercicio original. NO los resuelvas.
+2. EMOJIS: Usa emojis amigables (🔢, 📖, ✍️).
+3. PISTAS: 💡 en verde itálico debajo de las preguntas.
+4. IMÁGENES:  para apoyos visuales.
+5. RESALTE: **Negrita** solo en evidencia nuclear. No resaltes conectores."""
 
-REGLAS DE ORO:
-1. FIDELIDAD: Copia cada ejercicio. NO los resuelvas.
-2. EMOJIS: Usa emojis para hacer el examen más amigable (ej: 🔢 para matemática, 📖 para lectura).
-3. PISTAS: Inserta 💡 en verde itálico debajo de las preguntas según la dificultad del alumno.
-4. IMÁGENES: Inserta  para conceptos que necesiten apoyo visual.
-5. RESALTE: **Negrita** solo para información nuclear de la respuesta. No resaltes conectores.
-6. SILENCIO: Prohibido incluir análisis para la docente."""
-
-# 3. GENERACIÓN DE IMÁGENES
-def generar_imagen_v10(descripcion):
+# 4. FUNCIONES DE GENERACIÓN
+def generar_imagen_ia(descripcion):
+    if not MODELO_IMG: return None
     try:
-        model = genai.GenerativeModel("imagen-3.0")
-        res = model.generate_content(f"Estilo educativo escolar, fondo blanco, minimalista: {descripcion}")
+        model = genai.GenerativeModel(MODELO_IMG)
+        res = model.generate_content(f"Estilo dibujo escolar, fondo blanco: {descripcion}")
         return io.BytesIO(res.candidates[0].content.parts[0].inline_data.data)
-    except:
-        return None
+    except: return None
 
-# 4. CREACIÓN DEL DOCUMENTO (Diseño Inclusivo)
 def crear_docx_v10(texto_ia, nombre, diagnostico, grupo, logo_bytes, gen_img):
     doc = Document()
     diag, grupo_v = str(diagnostico).lower(), str(grupo).upper()
     color_inst, color_pista = RGBColor(31, 73, 125), RGBColor(0, 102, 0)
 
-    # Header Fiel
     table = doc.add_table(rows=1, cols=2)
     if logo_bytes:
         try: table.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo_bytes), width=Inches(1.0))
@@ -75,10 +77,9 @@ def crear_docx_v10(texto_ia, nombre, diagnostico, grupo, logo_bytes, gen_img):
         linea = linea.strip()
         if not linea or any(x in linea.lower() for x in ["análisis:", "ayuda:"]): continue
 
-        # Inserción de Imagen con IA
         if "[IMAGEN:" in linea and gen_img:
             desc = linea.split("[IMAGEN:")[1].split("]")[0]
-            img_bytes = generar_imagen_v10(desc)
+            img_bytes = generar_imagen_ia(desc)
             if img_bytes:
                 para_i = doc.add_paragraph()
                 para_i.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -101,28 +102,33 @@ def crear_docx_v10(texto_ia, nombre, diagnostico, grupo, logo_bytes, gen_img):
     doc.save(bio)
     return bio
 
-# 5. INTERFAZ STREAMLIT
+# 5. INTERFAZ
 try:
-    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
     df = pd.read_csv(url)
     df.columns = [c.strip() for c in df.columns]
     
-    # Detección inteligente de columnas
     col_grado = [c for c in df.columns if "grado" in nrm(c)][0]
     col_nombre = [c for c in df.columns if "nombre" in nrm(c)][0]
     col_grupo = [c for c in df.columns if "grupo" in nrm(c)][0]
     col_casos = [c for c in df.columns if "casos" in nrm(c) or "emergente" in nrm(c)][0]
 
-    st.sidebar.header("Opciones de IA")
+    st.sidebar.header("🎯 Selección de Alumnos")
     grado_sel = st.sidebar.selectbox("Grado:", df[col_grado].unique())
     df_grado = df[df[col_grado] == grado_sel]
     
-    seleccionados = st.sidebar.multiselect("Alumnos:", df_grado[col_nombre].tolist())
-    alumnos_final = df_grado[df_grado[col_nombre].isin(seleccionados)] if seleccionados else df_grado
+    # NUEVO: Lógica de selección de alumnos solicitada
+    alcance = st.sidebar.radio("¿A quiénes adecuar?", ["Todos los alumnos", "Seleccionar cuáles"])
+    
+    if alcance == "Seleccionar cuáles":
+        seleccionados = st.sidebar.multiselect("Elige los alumnos:", df_grado[col_nombre].tolist())
+        alumnos_final = df_grado[df_grado[col_nombre].isin(seleccionados)]
+    else:
+        alumnos_final = df_grado
 
+    st.sidebar.divider()
     activar_img = st.sidebar.checkbox("Generar Apoyos Visuales 🖼️", value=True)
-    logo_file = st.sidebar.file_uploader("Logo Colegio", type=["png", "jpg"])
+    logo_file = st.sidebar.file_uploader("Logo", type=["png", "jpg"])
     logo_bytes = logo_file.read() if logo_file else None
     archivo_base = st.file_uploader("Examen Original (docx)", type=["docx"])
 
@@ -136,20 +142,20 @@ try:
             status = st.empty()
             
             for i, (_, fila) in enumerate(alumnos_final.iterrows()):
-                nombre, diag, grupo = str(fila[col_nombre]), str(fila[col_casos]), str(fila[col_grupo])
-                status.text(f"Adecuando: {nombre}...")
+                n, d, g = str(fila[col_nombre]), str(fila[col_casos]), str(fila[col_grupo])
+                status.text(f"Adecuando: {n}...")
                 
                 def llamar_ia():
-                    m = genai.GenerativeModel("gemini-1.5-flash")
-                    return m.generate_content(f"{SYSTEM_PROMPT}\n\nALUMNO: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN:\n{texto_base}")
+                    m = genai.GenerativeModel(MODELO_TEXTO)
+                    return m.generate_content(f"{SYSTEM_PROMPT}\n\nALUMNO: {n} ({d}, Grupo {g})\n\nEXAMEN:\n{texto_base}")
 
                 res = with_backoff(llamar_ia)
-                doc_res = crear_docx_v10(res.text, nombre, diag, grupo, logo_bytes, activar_img)
-                zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_res.getvalue())
+                doc_res = crear_docx_v10(res.text, n, d, g, logo_bytes, activar_img)
+                zip_f.writestr(f"Adecuacion_{n.replace(' ', '_')}.docx", doc_res.getvalue())
                 progreso.progress((i + 1) / len(alumnos_final))
 
-        st.success("¡Lote v10 finalizado!")
-        st.download_button("📥 Descargar ZIP", zip_buffer.getvalue(), f"Adecuaciones_{grado_sel}.zip")
+        st.success(f"Lote finalizado con modelo: {MODELO_TEXTO}")
+        st.download_button("📥 Descargar ZIP", zip_buffer.getvalue(), "Adecuaciones.zip")
 
 except Exception as e:
-    st.error(f"Error de sistema: {e}")
+    st.error(f"Fallo en el sistema: {e}")
