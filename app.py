@@ -8,55 +8,52 @@ import io
 import zipfile
 import time
 import re
+import traceback
 
 # 1. CONFIGURACIÓN ESTRUCTURAL
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
-OPCIONES_MODELOS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]
+MODELOS_CASCADA = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]
 
-st.set_page_config(page_title="Motor Pedagógico v6.8", layout="centered")
+st.set_page_config(page_title="Motor Pedagógico v7.1", layout="wide")
 
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    model_ai = genai.GenerativeModel('gemini-2.0-flash')
 except Exception as e:
-    st.error(f"Falta configurar la API KEY: {e}")
+    st.error("Error: No se encontró la API KEY en los Secrets.")
 
-# PROMPT MAESTRO (Control de Calidad)
-SYSTEM_PROMPT = """Eres un Diseñador Editorial Pedagógico. Genera el examen FINAL.
+# PROMPT MAESTRO (RESTAURACIÓN DE PISTAS + CONTROL)
+SYSTEM_PROMPT = """Eres un Psicopedagogo y Diseñador Editorial. Tu misión es generar la adecuación FINAL.
 
-REGLAS DE SILENCIO:
-1. PROHIBIDO incluir análisis, introducciones o explicaciones.
-2. NO resaltes conectores (y, con, por, de, fue, el, la).
-3. SÓLO resalta en **negrita** la información nuclear de la respuesta.
+REGLAS DE ANDAMIAJE (PISTAS):
+1. PISTAS: Genera pistas breves [PISTA] solo cuando el alumno lo necesite por su perfil. 
+   - La pista debe ayudar a ENTENDER qué hacer (ej: "Buscá el dato en el 2do párrafo").
+   - NO des la respuesta. Usa un tono alentador.
+2. RESALTE: Marca en **negrita** la información nuclear del texto que responde a las preguntas. NO resaltes conectores.
 
-REGLAS DE ESPACIO:
-1. SOLO usa [CUADRICULA] donde el alumno deba escribir.
-2. NO agregues líneas de puntos al azar."""
+REGLAS DE LIMPIEZA:
+1. PROHIBIDO: No incluyas intros, saludos ni análisis técnicos.
+2. ESPACIOS: Usa [CUADRICULA] solo donde el alumno deba escribir. Máximo 2 líneas de puntos por ejercicio.
+3. ESTÉTICA: No agregues líneas de puntos al azar entre párrafos."""
 
-# 2. FUNCIONES DE DISEÑO
-def limpiar_nombre_archivo(nombre):
-    return re.sub(r'[\\/*?:"<>|]', "", str(nombre)).replace(" ", "_")
+# 2. FUNCIONES DE DISEÑO Y LIMPIEZA
+def limpiar_output_ia(texto):
+    """Filtra líneas vacías de puntos y textos de análisis interno."""
+    lineas = texto.split('\n')
+    limpias = []
+    for l in lineas:
+        if re.match(r'^[\s\.*]*$', l): continue # Elimina líneas que solo tienen puntos
+        if any(x in l.lower() for x in ["análisis:", "ayuda:", "aquí tienes", "analisis pedagógico"]): continue
+        limpias.append(l)
+    return "\n".join(limpias)
 
-def extraer_texto(archivo):
-    ext = archivo.name.split('.')[-1].lower()
-    if ext == 'docx':
-        doc = Document(archivo)
-        return "\n".join([p.text for p in doc.paragraphs])
-    elif ext == 'pdf':
-        import PyPDF2
-        reader = PyPDF2.PdfReader(archivo)
-        return "\n".join([p.extract_text() for p in reader.pages])
-    return ""
-
-def crear_docx_final(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
+def crear_docx_premium(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     doc = Document()
-    diag = str(diagnostico).lower()
-    grupo = str(grupo).upper()
+    diag, grupo = str(diagnostico).lower(), str(grupo).upper()
     color_inst = RGBColor(31, 73, 125)
+    color_pista = RGBColor(0, 102, 0) # Verde oscuro para pistas
 
-    # Encabezado con Tabla
+    # Encabezado
     table = doc.add_table(rows=1, cols=2)
-    table.columns[0].width = Inches(1.5)
     if logo_bytes:
         try:
             run_logo = table.rows[0].cells[0].paragraphs[0].add_run()
@@ -70,7 +67,7 @@ def crear_docx_final(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     run.bold = True
     run.font.color.rgb = color_inst
 
-    # Fuente OpenDyslexic
+    # Tipografía Dinámica
     style = doc.styles['Normal']
     font = style.font
     is_apo = any(x in diag for x in ["dislexia", "discalculia", "general"]) or grupo == "A"
@@ -78,29 +75,33 @@ def crear_docx_final(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     font.size = Pt(12 if is_apo else 11)
     style.paragraph_format.line_spacing = 1.5 if is_apo else 1.15
 
-    for linea in texto_ia.split('\n'):
+    texto_limpio = limpiar_output_ia(texto_ia)
+    for linea in texto_limpio.split('\n'):
         linea = linea.strip()
-        # Filtro de basura (Análisis e intros)
-        if any(x in linea.lower() for x in ["análisis:", "ayuda:", "aquí tienes", "analisis:"]): continue
-        if re.match(r'^\.*$', linea): continue
         if not linea: continue
         
         para = doc.add_paragraph()
-        if "[CUADRICULA]" in linea:
-            for _ in range(2):
-                p_g = doc.add_paragraph()
-                p_g.add_run(" " + "." * 70).font.color.rgb = RGBColor(215, 215, 215)
-            continue
-
-        if "💡" in linea:
-            run_p = para.add_run(linea)
-            run_p.font.color.rgb = RGBColor(0, 102, 0)
+        
+        # Formato de Pistas
+        if "[PISTA]" in linea or "💡" in linea:
+            txt_pista = linea.replace("[PISTA]", "").replace("💡", "").strip()
+            run_p = para.add_run(f"💡 PISTA: {txt_pista}")
+            run_p.font.color.rgb = color_pista
             run_p.italic = True
             continue
 
-        es_titulo = "[TITULO]" in linea or (len(linea) < 55 and not linea.endswith('.'))
-        texto_limpio = linea.replace("[TITULO]", "").strip()
-        partes = texto_limpio.split("**")
+        # Formato de Cuadrícula Controlada
+        if "[CUADRICULA]" in linea:
+            for _ in range(2):
+                p_g = doc.add_paragraph()
+                p_g.add_run(" " + "." * 75).font.color.rgb = RGBColor(215, 215, 215)
+                p_g.paragraph_format.space_after = Pt(0)
+            continue
+
+        es_titulo = (len(linea) < 55 and not linea.endswith('.')) or "[TITULO]" in linea
+        linea_final = linea.replace("[TITULO]", "").strip()
+        
+        partes = linea_final.split("**")
         for i, parte in enumerate(partes):
             run_part = para.add_run(parte)
             if i % 2 != 0: run_part.bold = True
@@ -114,8 +115,8 @@ def crear_docx_final(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     bio.seek(0)
     return bio
 
-# 3. INTERFAZ (RESTURADA)
-st.title("Motor Pedagógico v6.8 🎓")
+# 3. INTERFAZ Y CONSOLA DE DIAGNÓSTICO
+st.title("Motor Pedagógico v7.1 🚀")
 
 try:
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
@@ -124,20 +125,23 @@ try:
     
     col_grado, col_nombre, col_grupo, col_emergente = df.columns[1], df.columns[2], df.columns[3], df.columns[4]
     
-    st.sidebar.header("Control de IA")
-    modelo_ini = st.sidebar.selectbox("Modelo:", OPCIONES_MODELOS)
+    st.sidebar.header("Opciones de IA")
+    modelo_ini = st.sidebar.selectbox("Prioridad de Modelo:", MODELOS_CASCADA)
     grado_sel = st.sidebar.selectbox("Grado:", df[col_grado].unique())
     alumnos_grado = df[(df[col_grado] == grado_sel) & (df[col_emergente].str.lower() != "ninguna")]
     
     logo_file = st.sidebar.file_uploader("Logo Colegio", type=["png", "jpg"])
     logo_bytes = logo_file.read() if logo_file else None
-    
-    archivo_base = st.file_uploader("Subir Examen Original", type=["docx", "pdf"])
+    archivo_base = st.file_uploader("Subir Examen Base", type=["docx", "pdf"])
 
-    if archivo_base and st.button(f"Adecuar {len(alumnos_grado)} alumnos"):
-        texto_base = extraer_texto(archivo_base)
+    if archivo_base and st.button(f"Procesar Grupo"):
+        from docx import Document as DocRead
+        doc_read = DocRead(archivo_base)
+        texto_base = "\n".join([p.text for p in doc_read.paragraphs])
+        
         zip_buffer = io.BytesIO()
-        cascada = [modelo_ini] + [m for m in OPCIONES_MODELOS if m != modelo_ini]
+        procesados_ok = 0
+        debug_logs = []
 
         with zipfile.ZipFile(zip_buffer, "w") as zip_f:
             archivo_base.seek(0)
@@ -145,28 +149,48 @@ try:
             
             progreso = st.progress(0)
             status = st.empty()
+            
+            orden_modelos = [modelo_ini] + [m for m in MODELOS_CASCADA if m != modelo_ini]
 
             for i, (_, fila) in enumerate(alumnos_grado.iterrows()):
                 nombre, diag, grupo = str(fila[col_nombre]), str(fila[col_emergente]), str(fila[col_grupo])
-                status.text(f"Procesando: {nombre}...")
+                status.text(f"Generando: {nombre}...")
                 
                 success = False
-                for m_name in cascada:
+                errores_acumulados = []
+
+                for m_name in orden_modelos:
                     if success: break
                     try:
+                        time.sleep(3) 
                         m_gen = genai.GenerativeModel(m_name)
-                        time.sleep(2)
-                        prompt = f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN:\n{texto_base}"
-                        res = m_gen.generate_content(prompt)
-                        doc_bytes = crear_docx_final(res.text, nombre, diag, grupo, logo_bytes)
-                        zip_f.writestr(f"Adecuacion_{limpiar_nombre_archivo(nombre)}.docx", doc_bytes.getvalue())
+                        p_prompt = f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN ORIGINAL:\n{texto_base}"
+                        res = m_gen.generate_content(p_prompt)
+                        
+                        doc_final = crear_docx_premium(res.text, nombre, diag, grupo, logo_bytes)
+                        zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_final.getvalue())
                         success = True
-                    except: continue
+                        procesados_ok += 1
+                    except Exception as e:
+                        errores_acumulados.append(f"{m_name}: {str(e)[:150]}")
+                        continue
+                
+                if not success:
+                    debug_logs.append({"alumno": nombre, "errores": errores_acumulados})
                 
                 progreso.progress((i + 1) / len(alumnos_grado))
 
-        st.success("ZIP generado correctamente.")
-        st.download_button("Descargar ZIP", zip_buffer.getvalue(), f"Examenes_{grado_sel}.zip")
+        if procesados_ok > 0:
+            st.success(f"Éxito: {procesados_ok} archivos generados.")
+            st.download_button("Descargar ZIP Completo", zip_buffer.getvalue(), f"Examenes_{grado_sel}.zip")
+        
+        if debug_logs:
+            with st.expander("🔍 Ventana de Diagnóstico"):
+                for log in debug_logs:
+                    st.warning(f"Alumno: {log['alumno']}")
+                    for err in log['errores']:
+                        st.write(f"- {err}")
+                    st.divider()
 
 except Exception as e:
-    st.error(f"Error en la carga: {e}")
+    st.error(f"Error general: {e}")
