@@ -1,7 +1,6 @@
 # app.py
 import streamlit as st
 import google.generativeai as genai
-
 import pandas as pd
 import json
 import io
@@ -9,698 +8,346 @@ import zipfile
 import time
 import random
 import hashlib
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(page_title="Motor Pedagógico Determinista v13.3", layout="wide")
+# ============================================================
+# CONFIGURACIÓN TÉCNICA Y SEGURIDAD
+# ============================================================
+st.set_page_config(
+    page_title="Motor Pedagógico Determinista v13.4", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
+# Constantes de Entorno
 MODEL_TEXT_DEFAULT = "gemini-1.5-flash"
-
-# IMPORTANT: El ID real de imagen depende de tu plataforma/entitlement.
-# Dejalo configurable y validalo. No asumas que "imagen-3.0" existe.
 MODEL_IMAGE_DEFAULT = "imagen-3.0"
+RETRIES = 6
+BACKOFF_BASE_SECONDS = 1.0
+CACHE_TTL_SECONDS = 6 * 60 * 60
 
+# Configuración de Generación Estricta
 GEN_CFG_JSON = {
     "response_mime_type": "application/json",
-    "temperature": 0,
-    "top_p": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
     "top_k": 1,
     "max_output_tokens": 4096,
 }
 
+# Filtros de Seguridad Educativa
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
-RETRIES = 6
-BACKOFF_BASE_SECONDS = 1.0
-CACHE_TTL_SECONDS = 6 * 60 * 60  # 6h
-
-# =========================
-# OPTIONAL: Pydantic
-# =========================
+# ============================================================
+# VALIDACIÓN DE ESQUEMAS (PYDANTIC)
+# ============================================================
 PYDANTIC_AVAILABLE = False
 try:
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, ValidationError
 
     class VisualModel(BaseModel):
-        habilitado: bool = Field(...)
-        prompt: Optional[str] = None
+        habilitado: bool = Field(..., description="Determina si requiere imagen")
+        prompt: Optional[str] = Field(None, description="Prompt descriptivo para la IA de imagen")
 
     class ItemModel(BaseModel):
-        tipo: str = Field(...)
-        enunciado_original: str = Field(...)
-        pista: str = Field(...)
-        visual: VisualModel = Field(...)
+        tipo: str = Field(..., description="Categoría del item")
+        enunciado_original: str = Field(..., description="Texto literal del examen")
+        pista: str = Field(..., description="Andamiaje pedagógico")
+        visual: VisualModel
 
     class AlumnoModel(BaseModel):
-        nombre: str = Field(...)
-        grupo: str = Field(...)
-        diagnostico: str = Field(...)
+        nombre: str
+        grupo: str
+        diagnostico: str
 
     class AdecuacionModel(BaseModel):
-        alumno: AlumnoModel = Field(...)
-        documento: List[ItemModel] = Field(...)
+        alumno: AlumnoModel
+        documento: List[ItemModel]
 
     PYDANTIC_AVAILABLE = True
-except Exception:
-    PYDANTIC_AVAILABLE = False
+except ImportError:
+    pass
 
-
-# =========================
-# Helpers
-# =========================
+# ============================================================
+# UTILIDADES DE SISTEMA Y CACHÉ
+# ============================================================
 def get_content_hash(text: str) -> str:
+    """Genera huella digital del examen para evitar re-procesamiento."""
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
-
-def _is_retryable_error(e: Exception) -> bool:
-    s = str(e).lower()
-    markers = [
-        "429",
-        "rate",
-        "quota",
-        "resource exhausted",
-        "too many requests",
-        "timeout",
-        "timed out",
-        "deadline",
-        "unavailable",
-        "503",
-        "500",
-        "internal",
-        "service",
-        "temporarily",
-        "connection reset",
-    ]
-    return any(m in s for m in markers)
-
+def clean_json_string(text: str) -> str:
+    """Elimina basura de Markdown y extrae solo el bloque JSON."""
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    return match.group(0) if match else text
 
 def retry_with_backoff(fn, retries: int = RETRIES, backoff_in_seconds: float = BACKOFF_BASE_SECONDS):
-    last = None
+    """Implementa exponencial backoff para cumplimiento de cuotas."""
+    last_err = None
     for attempt in range(retries + 1):
         try:
             return fn()
         except Exception as e:
-            last = e
-            if attempt >= retries or not _is_retryable_error(e):
-                raise
-            sleep = (backoff_in_seconds * (2 ** attempt)) + random.uniform(0, 0.75)
-            time.sleep(min(sleep, 30))
-    raise last
+            last_err = e
+            s = str(e).lower()
+            retryable = any(m in s for m in ["429", "rate", "quota", "timeout", "503", "500"])
+            if not retryable or attempt == retries:
+                raise last_err
+            time.sleep(min((backoff_in_seconds * (2 ** attempt)) + random.uniform(0, 1), 30))
+    raise last_err
 
-
-def normalize_bool(x: Any) -> bool:
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, float)):
-        return bool(x)
-    if isinstance(x, str):
-        v = x.strip().lower()
-        if v in {"true", "1", "yes", "y", "si", "sí"}:
-            return True
-        if v in {"false", "0", "no", "n"}:
-            return False
-    return False
-
-
-def normalize_visual(v: Any) -> Dict[str, Any]:
-    if not isinstance(v, dict):
-        return {"habilitado": False}
-    habil = normalize_bool(v.get("habilitado", False))
-    prompt = v.get("prompt")
-    if not isinstance(prompt, str):
-        prompt = ""
-    if not habil:
-        return {"habilitado": False}
-    return {"habilitado": True, "prompt": prompt.strip()}
-
-
-def basic_schema_validate_and_normalize(data: Any) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-    errors: List[str] = []
-    if not isinstance(data, dict):
-        return None, ["Root debe ser un objeto JSON."]
-
-    alumno = data.get("alumno")
-    documento = data.get("documento")
-
-    if not isinstance(alumno, dict):
-        errors.append("alumno debe ser objeto.")
-        alumno = {}
-    if not isinstance(documento, list):
-        errors.append("documento debe ser lista.")
-        documento = []
-
-    nombre = alumno.get("nombre", "")
-    grupo = alumno.get("grupo", "")
-    diagnostico = alumno.get("diagnostico", "")
-
-    if not isinstance(nombre, str) or not nombre.strip():
-        errors.append("alumno.nombre debe ser string no vacío.")
-    if not isinstance(grupo, str) or not grupo.strip():
-        errors.append("alumno.grupo debe ser string no vacío.")
-    if not isinstance(diagnostico, str):
-        errors.append("alumno.diagnostico debe ser string.")
-
-    norm_doc: List[Dict[str, Any]] = []
-    for idx, it in enumerate(documento):
-        if not isinstance(it, dict):
-            errors.append(f"documento[{idx}] debe ser objeto.")
-            continue
-
-        tipo = it.get("tipo", "consigna")
-        enun = it.get("enunciado_original", "")
-        pista = it.get("pista", "")
-        visual = normalize_visual(it.get("visual", {"habilitado": False}))
-
-        if not isinstance(tipo, str) or not tipo.strip():
-            tipo = "consigna"
-        if not isinstance(enun, str) or not enun.strip():
-            errors.append(f"documento[{idx}].enunciado_original debe ser string no vacío.")
-        if not isinstance(pista, str) or not pista.strip():
-            errors.append(f"documento[{idx}].pista debe ser string no vacío.")
-
-        norm_doc.append(
-            {
-                "tipo": tipo,
-                "enunciado_original": enun if isinstance(enun, str) else "",
-                "pista": pista if isinstance(pista, str) else "",
-                "visual": visual,
-            }
-        )
-
-    normalized = {
-        "alumno": {"nombre": str(nombre), "grupo": str(grupo), "diagnostico": str(diagnostico)},
-        "documento": norm_doc,
-    }
-    return normalized, errors
-
-
-# =========================
-# DOCX extraction (paragraphs + tables in body order)
-# =========================
+# ============================================================
+# EXTRACCIÓN DOCX (REFACTORIZADA)
+# ============================================================
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
-
-def _extract_text_from_element(el) -> str:
-    parts = []
-    for node in el.iter():
-        if node.tag == f"{W_NS}t" and node.text:
-            parts.append(node.text)
-    return "".join(parts).strip()
-
+def _extract_rich_text(el) -> str:
+    """Extrae texto manteniendo coherencia de espacios entre nodos."""
+    return "".join(node.text for node in el.iter(f"{W_NS}t") if node.text).strip()
 
 def extraer_contenido_completo(file) -> str:
+    """Parsea el DOCX respetando el flujo de lectura (párrafos y tablas)."""
     doc = Document(file)
-    contenido: List[str] = []
+    buffer: List[str] = []
 
     for element in doc.element.body:
         if element.tag == f"{W_NS}p":
-            text = _extract_text_from_element(element)
-            if text:
-                contenido.append(text)
+            t = _extract_rich_text(element)
+            if t: buffer.append(t)
         elif element.tag == f"{W_NS}tbl":
             for row in element.findall(f".//{W_NS}tr"):
-                row_cells = []
-                for cell in row.findall(f".//{W_NS}tc"):
-                    cell_text = _extract_text_from_element(cell)
-                    row_cells.append(cell_text)
-                line = "\t".join([c for c in row_cells if c is not None])
-                if line.strip():
-                    contenido.append(line.strip())
-            contenido.append("")  # spacer after table
+                cells = [_extract_rich_text(c) for c in row.findall(f".//{W_NS}tc")]
+                line = " | ".join(cells)
+                if line.strip(): buffer.append(f"[TABLA] {line}")
+            buffer.append("") # Separador visual pro-contexto
+            
+    return "\n".join(buffer).strip()
 
-    return "\n".join([c for c in contenido if c is not None]).strip()
-
-
-# =========================
-# Image model validation (best effort)
-# =========================
-def list_text_models() -> List[str]:
-    try:
-        ms = genai.list_models()
-        out = []
-        for m in ms:
-            methods = getattr(m, "supported_generation_methods", [])
-            if "generateContent" in methods:
-                out.append(m.name)
-        return out
-    except Exception:
-        return []
-
-
-def smoke_test_image_model(model_id: str) -> Tuple[bool, str]:
-    """
-    Valida "imagen" por prueba real:
-    - Llama al modelo con un prompt fijo.
-    - Verifica que haya inline_data bytes.
-    """
-    prompt = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: manzana"
+# ============================================================
+# MOTOR DE IMAGEN (DIAGNÓSTICO CACHEADO)
+# ============================================================
+@st.cache_resource(show_spinner="Validando capacidad de imagen...")
+def validate_image_capability(model_id: str) -> Tuple[bool, str]:
+    """Testea el modelo de imagen una sola vez por sesión."""
+    test_prompt = "Dibujo lineal simple, fondo blanco, una manzana"
     try:
         model = genai.GenerativeModel(model_id)
-
-        def _call():
-            return model.generate_content(prompt, safety_settings=SAFETY_SETTINGS)
-
-        res = retry_with_backoff(_call)
-        # Parse defensivo
-        cand = res.candidates[0]
-        part0 = cand.content.parts[0]
-        inline = getattr(part0, "inline_data", None)
-        data = getattr(inline, "data", None) if inline else None
-        if not data:
-            return False, "Respuesta sin inline_data.data (no parece ser modelo de imagen compatible)."
-        if len(data) < 500:
-            return False, f"inline_data.data demasiado chico ({len(data)} bytes)."
-        return True, f"OK (bytes={len(data)})"
+        res = model.generate_content(test_prompt, safety_settings=SAFETY_SETTINGS)
+        if hasattr(res.candidates[0].content.parts[0], "inline_data"):
+            return True, "Capacidad de imagen confirmada."
+        return False, "El modelo no devolvió datos binarios (inline_data)."
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"Fallo de validación: {str(e)}"
 
+def generar_imagen_ia(model_id: str, prompt: str) -> Optional[io.BytesIO]:
+    """Generador desacoplado con validación de integridad de bytes."""
+    try:
+        model = genai.GenerativeModel(model_id)
+        res = retry_with_backoff(lambda: model.generate_content(prompt, safety_settings=SAFETY_SETTINGS))
+        img_data = res.candidates[0].content.parts[0].inline_data.data
+        if img_data and len(img_data) > 1000:
+            return io.BytesIO(img_data)
+        return None
+    except:
+        return None
 
-# =========================
-# Gemini JSON generation + repair
-# =========================
-BASE_JSON_INSTRUCTIONS = """
-Devuelve EXCLUSIVAMENTE un JSON válido (sin markdown, sin texto extra, sin comentarios).
-
-Esquema obligatorio:
+# ============================================================
+# LÓGICA GEMINI (JSON + REPARACIÓN)
+# ============================================================
+PROMPT_SYSTEM = """
+Genera un JSON ESTRUCTURADO. No incluyas explicaciones.
+Esquema:
 {
-  "alumno": { "nombre": "string", "grupo": "string", "diagnostico": "string" },
+  "alumno": {"nombre": "string", "grupo": "string", "diagnostico": "string"},
   "documento": [
     {
       "tipo": "consigna",
-      "enunciado_original": "texto literal completo de la consigna",
-      "pista": "pista pedagógica breve (no dar respuesta)",
-      "visual": { "habilitado": boolean, "prompt": "string opcional" }
+      "enunciado_original": "copia literal",
+      "pista": "pista pedagógica breve",
+      "visual": {"habilitado": bool, "prompt": "string descriptivo"}
     }
   ]
 }
-
 Reglas:
-1) Incluye TODAS las consignas del examen SIN OMITIR ninguna.
-2) enunciado_original debe ser COPIA FIEL del examen (no parafrasear).
-3) Ajusta la pista por diagnóstico y grupo. No entregues la solución.
-4) visual.habilitado:
-   - true solo si realmente ayuda a razonar.
-   - Si true, visual.prompt debe empezar EXACTAMENTE con:
-     "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
-     y luego el objeto/escena breve.
-   - Si false, no incluyas prompt o déjalo vacío.
-5) Prohibido: saludos, análisis, explicaciones al docente, texto fuera del JSON.
-""".strip()
+1. enunciado_original DEBE ser literal.
+2. Si visual.habilitado=true, prompt DEBE iniciar con: 'Dibujo escolar, trazos negros, fondo blanco, estilo simple de: '.
+"""
 
-
-def build_prompt(nombre: str, diagnostico: str, grupo: str, examen_texto: str) -> str:
-    return f"""{BASE_JSON_INSTRUCTIONS}
-
-Alumno:
-- nombre: {nombre}
-- grupo: {grupo}
-- diagnostico: {diagnostico}
-
-EXAMEN ORIGINAL (copia literal):
-{examen_texto}
-""".strip()
-
-
-def build_repair_prompt(bad_text: str, errors: List[str]) -> str:
-    err_txt = "\n".join([f"- {e}" for e in errors]) if errors else "- JSON inválido o no parseable."
-    return f"""
-Devuelve EXCLUSIVAMENTE un JSON válido y corregido (sin texto extra).
-
-Errores detectados:
-{err_txt}
-
-JSON A CORREGIR:
-{bad_text}
-
-Recuerda: debe cumplir EXACTAMENTE el esquema y reglas. No agregues nada fuera del JSON.
-""".strip()
-
-
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def _cached_gemini_json(cache_key: str, model_text: str, prompt: str) -> Dict[str, Any]:
-    model = genai.GenerativeModel(model_text)
-
-    def _call():
-        return model.generate_content(
-            prompt,
-            generation_config=GEN_CFG_JSON,
-            safety_settings=SAFETY_SETTINGS,
-        )
-
-    resp = retry_with_backoff(_call)
-    text = getattr(resp, "text", "") or ""
-    data = json.loads(text)
-
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def process_student_json(cache_key, model_id, prompt_full) -> Dict[str, Any]:
+    """Caché inteligente de adecuaciones."""
+    model = genai.GenerativeModel(model_id)
+    resp = retry_with_backoff(lambda: model.generate_content(prompt_full, generation_config=GEN_CFG_JSON))
+    
+    raw_text = clean_json_string(resp.text)
+    data = json.loads(raw_text)
+    
     if PYDANTIC_AVAILABLE:
         AdecuacionModel.model_validate(data)
-        return data
+    return data
 
-    normalized, errs = basic_schema_validate_and_normalize(data)
-    if errs:
-        raise ValueError(f"Schema inválido: {errs[:8]}")
-    return normalized  # type: ignore
-
-
-def solicitar_adecuacion_json(
-    nombre: str,
-    diagnostico: str,
-    grupo: str,
-    examen_texto: str,
-    exam_hash: str,
-    model_text: str,
-) -> Dict[str, Any]:
-    prompt = build_prompt(nombre, diagnostico, grupo, examen_texto)
-    cache_key = f"{exam_hash}::{nombre}::{grupo}::{diagnostico}::{model_text}"
-
-    try:
-        return _cached_gemini_json(cache_key, model_text, prompt)
-    except Exception:
-        # Repair once: capture raw response, validate, else repair
-        model = genai.GenerativeModel(model_text)
-
-        def _call_raw():
-            return model.generate_content(
-                prompt,
-                generation_config=GEN_CFG_JSON,
-                safety_settings=SAFETY_SETTINGS,
-            )
-
-        resp = retry_with_backoff(_call_raw)
-        raw_text = getattr(resp, "text", "") or ""
-
-        parse_errors: List[str] = []
-        parsed = None
-        try:
-            parsed = json.loads(raw_text)
-        except Exception as je:
-            parse_errors.append(f"No se pudo parsear JSON: {je}")
-
-        if parsed is not None:
-            if PYDANTIC_AVAILABLE:
-                try:
-                    AdecuacionModel.model_validate(parsed)
-                    return parsed
-                except Exception as ve:
-                    parse_errors.append(str(ve))
-            else:
-                normalized, errs = basic_schema_validate_and_normalize(parsed)
-                if not errs and normalized:
-                    return normalized
-                parse_errors.extend(errs)
-
-        repair_prompt = build_repair_prompt(raw_text, parse_errors)
-
-        def _call_repair():
-            return model.generate_content(
-                repair_prompt,
-                generation_config=GEN_CFG_JSON,
-                safety_settings=SAFETY_SETTINGS,
-            )
-
-        repaired = retry_with_backoff(_call_repair)
-        repaired_text = getattr(repaired, "text", "") or ""
-        data2 = json.loads(repaired_text)
-
-        if PYDANTIC_AVAILABLE:
-            AdecuacionModel.model_validate(data2)
-            return data2
-
-        normalized2, errs2 = basic_schema_validate_and_normalize(data2)
-        if errs2 or not normalized2:
-            raise ValueError(f"JSON reparado inválido: {errs2[:10]}")
-        return normalized2
-
-
-# =========================
-# Image generation with validation + fallback
-# =========================
-def generar_imagen_ia(model_image: str, prompt_visual: str) -> Optional[io.BytesIO]:
-    """
-    Genera imagen y valida:
-    - existencia de inline_data.data
-    - tamaño mínimo de bytes
-    """
-    try:
-        model = genai.GenerativeModel(model_image)
-
-        def _call():
-            return model.generate_content(prompt_visual, safety_settings=SAFETY_SETTINGS)
-
-        res = retry_with_backoff(_call)
-        cand = res.candidates[0]
-        part0 = cand.content.parts[0]
-        inline = getattr(part0, "inline_data", None)
-        data = getattr(inline, "data", None) if inline else None
-        if not data or len(data) < 500:
-            return None
-        return io.BytesIO(data)
-    except Exception:
-        return None
-
-
-# =========================
-# DOCX render
-# =========================
-def renderizar_docx(data_json: Dict[str, Any], logo_bytes: Optional[bytes], gen_img_bool: bool, model_image: str) -> bytes:
+# ============================================================
+# RENDERIZADO DETERMINISTA
+# ============================================================
+def render_docx(data: Dict, logo: Optional[bytes], img_enabled: bool, img_model: str) -> bytes:
     doc = Document()
-
-    header_table = doc.add_table(rows=1, cols=2)
-    if logo_bytes:
+    
+    # Header Dinámico
+    table = doc.add_table(rows=1, cols=2)
+    if logo:
         try:
-            header_table.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo_bytes), width=Inches(0.85))
-        except Exception:
-            pass
+            table.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo), width=Inches(0.85))
+        except: pass
+    
+    c_info = table.rows[0].cells[1].paragraphs[0]
+    c_info.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    al = data["alumno"]
+    header = c_info.add_run(f"ALUMNO: {al['nombre']}\nGRUPO: {al['grupo']} | APOYO: {al['diagnostico']}")
+    header.bold = True
+    header.font.size = Pt(10)
 
-    cell_info = header_table.rows[0].cells[1]
-    p_info = cell_info.paragraphs[0]
-    p_info.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-
-    al = data_json.get("alumno", {})
-    nombre = str(al.get("nombre", "")).strip()
-    grupo = str(al.get("grupo", "")).strip()
-    diag = str(al.get("diagnostico", "")).strip()
-
-    run = p_info.add_run(f"ALUMNO: {nombre}\nGRUPO: {grupo} | APOYO: {diag}")
-    run.bold = True
-    run.font.size = Pt(10)
-
-    green = RGBColor(0, 128, 0)
-    items = data_json.get("documento", []) if isinstance(data_json.get("documento"), list) else []
-
-    required_prefix = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        enun = str(item.get("enunciado_original", "")).strip()
-        pista = str(item.get("pista", "")).strip()
-        visual = normalize_visual(item.get("visual", {"habilitado": False}))
-
-        if not enun:
-            continue
-
+    # Procesamiento de Consignas
+    for item in data.get("documento", []):
+        # Texto Original
         p_orig = doc.add_paragraph()
-        r1 = p_orig.add_run(enun)
-        r1.font.size = Pt(11)
-        p_orig.paragraph_format.space_after = Pt(3)
+        p_orig.add_run(item["enunciado_original"]).font.size = Pt(11)
+        
+        # Pista Pedagógica
+        p_pista = doc.add_paragraph()
+        pista_run = p_pista.add_run(f"💡 {item['pista']}")
+        pista_run.font.color.rgb = RGBColor(0, 120, 0)
+        pista_run.italic = True
+        pista_run.font.size = Pt(10)
 
-        if pista:
-            p_pista = doc.add_paragraph()
-            r2 = p_pista.add_run(f"💡 {pista}")
-            r2.font.color.rgb = green
-            r2.italic = True
-            r2.font.size = Pt(10)
-            p_pista.paragraph_format.space_after = Pt(4)
-
-        if gen_img_bool and visual.get("habilitado", False):
-            pv = str(visual.get("prompt", "") or "").strip()
-            if pv and not pv.startswith(required_prefix):
-                pv = required_prefix + pv
-            if pv:
-                img_data = generar_imagen_ia(model_image, pv)
-                if img_data:
-                    p_img = doc.add_paragraph()
-                    p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    try:
-                        p_img.add_run().add_picture(img_data, width=Inches(2.6))
-                    except Exception:
-                        pass
-                    p_img.paragraph_format.space_after = Pt(6)
+        # Inserción de Imagen (si aplica)
+        if img_enabled and item["visual"]["habilitado"]:
+            p = item["visual"]["prompt"]
+            img_stream = generar_imagen_ia(img_model, p)
+            if img_stream:
+                p_img = doc.add_paragraph()
+                p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p_img.add_run().add_picture(img_stream, width=Inches(2.8))
+        
+        doc.add_paragraph() # Spacer
 
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
 
-
-# =========================
-# UI
-# =========================
+# ============================================================
+# INTERFAZ DE USUARIO (STREAMLIT)
+# ============================================================
 def main():
-    st.title("Motor Pedagógico Determinista v13.3")
-
-    # Configure API key
+    st.header("🧠 Motor Pedagógico Determinista v13.4")
+    
     try:
         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    except Exception:
-        st.error("Falta GOOGLE_API_KEY en st.secrets.")
+    except:
+        st.error("API Key no configurada en Secrets.")
         return
 
-    # Load CSV
+    # Carga de Planilla
     try:
         df = pd.read_csv(URL_PLANILLA)
         df.columns = [c.strip() for c in df.columns]
     except Exception as e:
-        st.error(f"Error leyendo planilla CSV: {e}")
+        st.error(f"Error cargando base de datos: {e}")
         return
 
-    # Sidebar
     with st.sidebar:
-        st.header("⚙️ Configuración")
-
-        model_text = st.text_input("Modelo texto", value=MODEL_TEXT_DEFAULT)
-        model_image = st.text_input("Modelo imagen", value=MODEL_IMAGE_DEFAULT)
-
-        # Model listing (best effort)
-        with st.expander("Diagnóstico modelos (best effort)"):
-            if st.button("Listar modelos visibles"):
-                models = list_text_models()
-                if not models:
-                    st.warning("No se pudieron listar modelos (o la API no los expone).")
-                else:
-                    st.code("\n".join(models))
-
-            st.caption("Validación de imagen = llamada real al modelo + verificación de inline_data.")
-            if st.button("Probar modelo de imagen actual"):
-                ok, msg = smoke_test_image_model(model_image)
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-
-        # Column mapping (por índice como venías usando)
-        grado_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
-        alumno_col = df.columns[2] if len(df.columns) > 2 else df.columns[0]
-        grupo_col = df.columns[3] if len(df.columns) > 3 else df.columns[0]
-        diag_col = df.columns[4] if len(df.columns) > 4 else df.columns[0]
-
-        grado = st.selectbox("Grado", sorted(df[grado_col].dropna().unique().tolist()))
-        df_f = df[df[grado_col] == grado].copy()
-
-        alcance = st.radio("¿A quiénes adecuar?", ["Todos", "Seleccionar"], horizontal=True)
-        if alcance == "Seleccionar":
-            alumnos_sel = st.multiselect("Alumnos", df_f[alumno_col].dropna().unique().tolist())
-            if alumnos_sel:
-                df_f = df_f[df_f[alumno_col].isin(alumnos_sel)]
-        else:
-            alumnos_sel = []
-
+        st.subheader("⚙️ Parámetros de Motor")
+        m_text = st.text_input("Modelo de Texto", MODEL_TEXT_DEFAULT)
+        m_img = st.text_input("Modelo de Imagen", MODEL_IMAGE_DEFAULT)
+        
         st.divider()
+        
+        # Mapeo de Columnas (Índices Estables)
+        g_col, a_col, gr_col, d_col = df.columns[1], df.columns[2], df.columns[3], df.columns[4]
+        
+        grado = st.selectbox("Seleccionar Grado", sorted(df[g_col].dropna().unique()))
+        df_f = df[df[g_col] == grado].copy()
+        
+        alcance = st.radio("Alcance", ["Todos", "Selección Manual"])
+        alumnos_proc = df_f[a_col].tolist()
+        if alcance == "Selección Manual":
+            alumnos_proc = st.multiselect("Alumnos", alumnos_proc)
+        
+        st.divider()
+        
+        req_img = st.checkbox("Generar imágenes IA", value=True)
+        valid_img, img_msg = False, ""
+        if req_img:
+            valid_img, img_msg = validate_image_capability(m_img)
+            if not valid_img: st.warning(img_status)
+        
+        logo = st.file_uploader("Logo Institucional", type=["png", "jpg", "jpeg"])
+        logo_data = logo.read() if logo else None
 
-        # Image enablement: validate first (optional but safer)
-        gen_img_requested = st.checkbox("Generar imágenes IA", value=True)
-        img_ok = False
-        img_status = ""
-        if gen_img_requested:
-            img_ok, img_status = smoke_test_image_model(model_image)
-            if not img_ok:
-                st.warning(f"Imágenes deshabilitadas: {img_status}")
-        gen_img = gen_img_requested and img_ok
-
-        logo = st.file_uploader("Logo", type=["png", "jpg", "jpeg"])
-        logo_bytes = logo.read() if logo else None
-
-        st.caption(f"Pydantic: {'ON' if PYDANTIC_AVAILABLE else 'OFF'}")
-        if gen_img_requested and not img_ok:
-            st.caption("Sugerencia: cambia MODEL_IMAGE por uno soportado por tu cuenta/endpoint.")
-
-    # File input
-    file_base = st.file_uploader("Examen base (DOCX)", type=["docx"])
-    if not file_base:
-        return
-
-    if st.button("Procesar lote"):
-        with st.spinner("Extrayendo contenido del DOCX..."):
-            exam_text = extraer_contenido_completo(file_base)
-        if not exam_text.strip():
-            st.error("No se pudo extraer texto del DOCX (vacío).")
+    # Operación Principal
+    file_docx = st.file_uploader("Examen Base (DOCX)", type=["docx"])
+    
+    if file_docx and st.button("🚀 Iniciar Procesamiento por Lote"):
+        if not alumnos_proc:
+            st.warning("Seleccione al menos un alumno.")
             return
 
-        exam_hash = get_content_hash(exam_text)
-
-        alumnos_data = df_f[[alumno_col, grupo_col, diag_col]].dropna(subset=[alumno_col]).copy()
-        total = len(alumnos_data)
-        if total == 0:
-            st.error("No hay alumnos para procesar con los filtros actuales.")
-            return
-
+        with st.spinner("Analizando examen..."):
+            exam_content = extraer_contenido_completo(file_docx)
+            exam_hash = get_content_hash(exam_content)
+        
+        # Filtro de Alumnos Final
+        df_final = df_f[df_f[a_col].isin(alumnos_proc)].copy()
+        total_a = len(df_final)
+        
         zip_io = io.BytesIO()
-        with zipfile.ZipFile(zip_io, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        with zipfile.ZipFile(zip_io, "w") as zf:
             bar = st.progress(0.0)
-            status = st.empty()
-
-            for i, (_, row) in enumerate(alumnos_data.iterrows(), start=1):
-                nombre = str(row[alumno_col]).strip()
-                grupo_val = str(row[grupo_col]).strip()
-                diag_val = str(row[diag_col]).strip()
-
-                status.text(f"({i}/{total}) JSON: {nombre}")
+            status_box = st.empty()
+            
+            for idx, (_, row) in enumerate(df_final.iterrows(), 1):
+                nom, grp, dia = str(row[a_col]), str(row[gr_col]), str(row[d_col])
+                
+                status_box.info(f"Procesando {idx}/{total_a}: {nom}")
+                
                 try:
-                    data_json = solicitar_adecuacion_json(
-                        nombre=nombre,
-                        diagnostico=diag_val,
-                        grupo=grupo_val,
-                        examen_texto=exam_text,
-                        exam_hash=exam_hash,
-                        model_text=model_text,
-                    )
-
-                    # Render
-                    status.text(f"({i}/{total}) DOCX: {nombre}")
-                    docx_bytes = renderizar_docx(data_json, logo_bytes, gen_img, model_image)
-
-                    safe_name = (
-                        nombre.replace(" ", "_")
-                        .replace("/", "_")
-                        .replace("\\", "_")
-                        .replace("..", "_")
-                    )
-                    zip_file.writestr(f"Adecuacion_{safe_name}.docx", docx_bytes)
-
-                except Exception as e:
-                    # Error artifact per student
-                    err_txt = (
-                        f"Alumno: {nombre}\n"
-                        f"Grupo: {grupo_val}\n"
-                        f"Diagnóstico: {diag_val}\n"
-                        f"Error: {type(e).__name__}: {e}\n"
-                    )
-                    zip_file.writestr(f"ERROR_{nombre.replace(' ', '_')}.txt", err_txt.encode("utf-8"))
-
-                bar.progress(i / total)
-
-        st.success("Lote completado.")
+                    # Generación JSON
+                    key = f"{exam_hash}_{nom}_{dia}"
+                    prompt = f"{PROMPT_SYSTEM}\nAlumno: {nom}\nGrupo: {grp}\nDiagnóstico: {dia}\nExamen: {exam_content}"
+                    
+                    data_json = process_student_json(key, m_text, prompt)
+                    
+                    # Generación DOCX
+                    docx_data = render_docx(data_json, logo_data, valid_img, m_img)
+                    
+                    filename = f"Adecuacion_{nom.replace(' ', '_')}.docx"
+                    zf.writestr(filename, docx_data)
+                    
+                except Exception as ex:
+                    err_msg = f"ERROR en {nom}: {str(ex)}"
+                    zf.writestr(f"FALLO_{nom.replace(' ', '_')}.txt", err_msg.encode())
+                    st.error(err_msg)
+                
+                bar.progress(idx / total_a)
+        
+        st.success("🏁 Lote completado.")
         st.download_button(
-            "Descargar ZIP",
+            label="📥 Descargar ZIP de Adecuaciones",
             data=zip_io.getvalue(),
-            file_name="adecuaciones.zip",
-            mime="application/zip",
+            file_name=f"Adecuaciones_{grado}_{int(time.time())}.zip",
+            mime="application/zip"
         )
-
 
 if __name__ == "__main__":
     main()
