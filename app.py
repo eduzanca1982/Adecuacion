@@ -16,49 +16,50 @@ OPCIONES_MODELOS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-fla
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 except Exception as e:
-    st.error(f"Falta GOOGLE_API_KEY: {e}")
+    st.error(f"Error de configuración: {e}")
 
-# PROMPT MAESTRO CON LÓGICA DE PISTAS
-SYSTEM_PROMPT = """Eres un Psicopedagogo experto. Tu objetivo es el andamiaje cognitivo.
+# PROMPT MAESTRO: FOCO EN INTENCIONALIDAD DOCENTE
+SYSTEM_PROMPT = """Eres un Psicopedagogo de apoyo en aula. Tu misión es analizar la intención de la docente en cada ejercicio y personalizar la ayuda.
 
-REGLAS DE APOYO (SOLO PARA GRUPO A O DIFICULTADES):
-1. PISTAS PEDAGÓGICAS: Para problemas de matemáticas o preguntas de comprensión, añade una breve "Pista" o "Idea" que ayude a iniciar el proceso (ej: "Para resolver esto, pensá si tenés que agregar o quitar").
-2. AYUDA MEMORIA: Si el ejercicio requiere un concepto específico, inclúyelo de forma simple (ej: "Recordá: 1 metro = 100 cm").
-3. RESALTE DE RESPUESTAS: En los textos, marca en **negrita** las oraciones donde está la respuesta.
-4. MATEMÁTICAS: Marca datos numéricos en **negrita** y la pregunta central con ❓.
-5. FORMATO: Usa [PISTA] para estas ayudas y [CUADRICULA] para espacios de resolución.
+PROCESO DE PENSAMIENTO:
+1. Analiza cada pregunta: ¿Qué espera la docente que el alumno responda?
+2. Diseña la ayuda: Basado en el perfil del alumno (Dislexia, TDAH, etc.), resalta en el texto original SOLAMENTE lo que ayuda a cumplir ese objetivo.
+3. Personaliza la pista: Crea una [PISTA] breve que funcione como un andamio (no la respuesta, sino el cómo llegar).
 
-GENERAL:
-- No uses introducciones. Títulos con [TITULO].
-- Iconos: 📖 (Lectura), 🔢 (Cálculo), 💡 (Pista)."""
+REGLAS DE FORMATO:
+- DISLEXIA: Resalta conectores y palabras clave. Fuente OpenDyslexic.
+- TDAH: Segmenta y numera pasos. Pistas de "parar y revisar".
+- MATEMÁTICA: Resalta datos numéricos y verbos operativos.
+- ICONOS: 📖 (Lectura), 🔢 (Matemática), 💡 (Pista), ❓ (Pregunta).
+- MANTÉN TÍTULOS CON [TITULO] Y LÍNEAS CON [CUADRICULA]."""
 
-# 2. FUNCIONES DE MAQUETACIÓN PREMIUM
+# 2. FUNCIONES EDITORIALES
 def limpiar_nombre(nombre):
     return re.sub(r'[\\/*?:"<>|]', "", str(nombre)).replace(" ", "_")
 
-def crear_docx_andamiaje(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
+def crear_docx_fiel(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     doc = Document()
     diag = str(diagnostico).lower()
     grupo = str(grupo).upper()
     color_inst = RGBColor(31, 73, 125)
-    color_pista = RGBColor(0, 102, 0) # Verde oscuro pedagógico
+    color_pista = RGBColor(0, 102, 0)
 
-    # Encabezado con Tabla
+    # Encabezado
     table = doc.add_table(rows=1, cols=2)
     if logo_bytes:
         try:
             run_logo = table.rows[0].cells[0].paragraphs[0].add_run()
-            run_logo.add_picture(io.BytesIO(logo_bytes), width=Inches(1.1))
+            run_logo.add_picture(io.BytesIO(logo_bytes), width=Inches(1.0))
         except: pass
     
     cell_info = table.rows[0].cells[1]
     p = cell_info.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = p.add_run(f"ALUMNO: {nombre.upper()}\nGRUPO: {grupo} | APOYO: {diagnostico.upper()}")
+    run = p.add_run(f"ESTUDIANTE: {nombre.upper()}\nAPOYO: {diagnostico.upper()} | GRUPO: {grupo}")
     run.bold = True
     run.font.color.rgb = color_inst
 
-    # Configuración de fuente accesible
+    # Fuente
     style = doc.styles['Normal']
     font = style.font
     is_apo = any(x in diag for x in ["dislexia", "discalculia", "general"]) or grupo == "A"
@@ -72,17 +73,17 @@ def crear_docx_andamiaje(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
         
         para = doc.add_paragraph()
         
-        # Tratamiento de PISTAS (💡)
         if "[PISTA]" in linea or "💡" in linea:
-            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            run_p = para.add_run(linea.replace("[PISTA]", "💡 PISTA: "))
+            txt = linea.replace("[PISTA]", "").replace("💡", "").strip()
+            run_p = para.add_run(f"💡 PISTA: {txt}")
             run_p.font.color.rgb = color_pista
             run_p.italic = True
             continue
 
-        # Tratamiento de CUADRICULA
         if "[CUADRICULA]" in linea:
-            para.add_run("\n" + "." * 70 + "\n" + "." * 70).font.color.rgb = RGBColor(210, 210, 210)
+            for _ in range(3):
+                p_g = doc.add_paragraph()
+                p_g.add_run(" " + "." * 75).font.color.rgb = RGBColor(215, 215, 215)
             continue
 
         es_titulo = "[TITULO]" in linea or (len(linea) < 55 and not linea.endswith('.'))
@@ -102,29 +103,26 @@ def crear_docx_andamiaje(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     bio.seek(0)
     return bio
 
-# 3. INTERFAZ STREAMLIT
-st.title("Motor de Adecuación v6.2 Premium 🎓💡")
+# 3. INTERFAZ
+st.title("Motor Pedagógico v6.5 🎓")
 
 try:
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
     df = pd.read_csv(url)
     df.columns = [c.strip() for c in df.columns]
     
-    col_grado = df.columns[1]
-    col_nombre = df.columns[2]
-    col_grupo = df.columns[3]
-    col_emergente = df.columns[4]
+    col_grado, col_nombre, col_grupo, col_emergente = df.columns[1], df.columns[2], df.columns[3], df.columns[4]
     
-    st.sidebar.header("Control de IA")
-    modelo_ini = st.sidebar.selectbox("Modelo Principal:", OPCIONES_MODELOS)
-    grado_sel = st.sidebar.selectbox("Seleccionar Grado:", df[col_grado].unique())
+    st.sidebar.header("Inteligencia Artificial")
+    modelo_ini = st.sidebar.selectbox("Modelo:", OPCIONES_MODELOS)
+    grado_sel = st.sidebar.selectbox("Grado:", df[col_grado].unique())
     alumnos_grado = df[(df[col_grado] == grado_sel) & (df[col_emergente].str.lower() != "ninguna")]
     
-    logo_file = st.sidebar.file_uploader("Logo Institucional", type=["png", "jpg"])
+    logo_file = st.sidebar.file_uploader("Logo Colegio", type=["png", "jpg"])
     logo_bytes = logo_file.read() if logo_file else None
-    archivo_base = st.file_uploader("Subir Examen (DOCX/PDF)", type=["docx", "pdf"])
+    archivo_base = st.file_uploader("Examen Original", type=["docx", "pdf"])
 
-    if archivo_base and st.button(f"Procesar Grado ({len(alumnos_grado)} alumnos)"):
+    if archivo_base and st.button(f"Adecuar {len(alumnos_grado)} alumnos"):
         from docx import Document as DocRead
         doc_read = DocRead(archivo_base)
         texto_base = "\n".join([p.text for p in doc_read.paragraphs])
@@ -140,10 +138,8 @@ try:
             status = st.empty()
 
             for i, (_, fila) in enumerate(alumnos_grado.iterrows()):
-                nombre = str(fila[col_nombre])
-                diag = str(fila[col_emergente])
-                grupo = str(fila[col_grupo])
-                status.text(f"Generando andamiaje para: {nombre}...")
+                nombre, diag, grupo = str(fila[col_nombre]), str(fila[col_emergente]), str(fila[col_grupo])
+                status.text(f"Analizando intención docente para: {nombre}...")
                 
                 success = False
                 for m_name in cascada:
@@ -151,10 +147,10 @@ try:
                     try:
                         m_gen = genai.GenerativeModel(m_name)
                         time.sleep(2)
-                        p_prompt = f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} (Grupo {grupo}, {diag})\n\nEXAMEN:\n{texto_base}"
+                        p_prompt = f"{SYSTEM_PROMPT}\n\nPERFIL ALUMNO: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN A ANALIZAR:\n{texto_base}"
                         res = m_gen.generate_content(p_prompt)
                         
-                        doc_bytes = crear_docx_andamiaje(res.text, nombre, diag, grupo, logo_bytes)
+                        doc_bytes = crear_docx_fiel(res.text, nombre, diag, grupo, logo_bytes)
                         zip_f.writestr(f"Adecuacion_{limpiar_nombre(nombre)}.docx", doc_bytes.getvalue())
                         success = True
                         break
@@ -162,8 +158,8 @@ try:
                 
                 progreso.progress((i + 1) / len(alumnos_grado))
 
-        st.success("¡Adecuación con Pistas completada!")
+        st.success("Adecuación finalizada con éxito.")
         st.download_button("Descargar ZIP", zip_buffer.getvalue(), f"Examenes_{grado_sel}.zip")
 
 except Exception as e:
-    st.error(f"Error técnico: {e}")
+    st.error(f"Error: {e}")
