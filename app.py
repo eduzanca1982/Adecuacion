@@ -9,34 +9,39 @@ import zipfile
 import time
 import re
 
-# 1. CONFIGURACIÓN ESTRUCTURAL
+# 1. CONFIGURACIÓN ESTRUCTURAL Y ESCANEO
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
-# Nombres corregidos para evitar el error 404
-MODELOS_CASCADA = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"]
-
-st.set_page_config(page_title="Motor Pedagógico v7.3", layout="wide")
+st.set_page_config(page_title="Motor Pedagógico v7.5", layout="wide")
 
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    
+    # --- FUNCIÓN DE ESCANEO PREVENTIVO ---
+    def obtener_modelos_disponibles():
+        disponibles = []
+        for m in genai.list_models():
+            # Filtramos solo los modelos que soportan generación de texto (GenerateContent)
+            if 'generateContent' in m.supported_generation_methods:
+                disponibles.append(m.name)
+        # Priorizamos 2.0 y 1.5 si están en la lista
+        prioridad = ["models/gemini-2.0-flash", "models/gemini-2.0-flash-lite", "models/gemini-1.5-flash"]
+        final = [p for p in prioridad if p in disponibles]
+        # Agregamos el resto que no esté en prioridad
+        final += [d for d in disponibles if d not in final]
+        return final
+
+    MODELOS_VALIDOS = obtener_modelos_disponibles()
 except Exception as e:
-    st.error("Error: Configura la API KEY en los Secrets.")
+    st.error(f"Error de conexión o API Key: {e}")
+    MODELOS_VALIDOS = []
 
 SYSTEM_PROMPT = """Eres un Psicopedagogo experto. Genera la adecuación FINAL del examen.
+REGLAS:
+1. PISTAS: Breves [PISTA] solo para Grupo A o Dificultad General.
+2. RESALTE: En **negrita** solo información nuclear de la respuesta.
+3. LIMPIEZA: Prohibido intros, análisis o líneas de puntos excesivas."""
 
-REGLAS DE ANDAMIAJE:
-1. PISTAS: Para alumnos de Grupo A o Dificultad General, genera pistas breves [PISTA] (máx 2 renglones) que ayuden al razonamiento.
-2. RESALTE: Marca en **negrita** la información nuclear del texto que responde a las preguntas. NO resaltes conectores.
-
-REGLAS DE LIMPIEZA:
-1. PROHIBIDO: No incluyas intros ni análisis técnicos.
-2. ESPACIOS: Usa [CUADRICULA] solo donde el alumno deba escribir (máx 2 líneas)."""
-
-# 2. FUNCIONES TÉCNICAS
-def limpiar_output(texto):
-    lineas = texto.split('\n')
-    limpias = [l for l in lineas if not any(x in l.lower() for x in ["análisis:", "ayuda:", "analisis:"]) and not re.match(r'^[\s\.*]*$', l)]
-    return "\n".join(limpias)
-
+# 2. FUNCIONES DE DISEÑO
 def crear_docx(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     doc = Document()
     diag, grupo = str(diagnostico).lower(), str(grupo).upper()
@@ -62,30 +67,23 @@ def crear_docx(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     font.size = Pt(12 if is_apo else 11)
     style.paragraph_format.line_spacing = 1.5 if is_apo else 1.15
 
-    texto_limpio = limpiar_output(texto_ia)
-    for linea in texto_limpio.split('\n'):
+    for linea in texto_ia.split('\n'):
         linea = linea.strip()
-        if not linea: continue
+        if not linea or any(x in linea.lower() for x in ["análisis:", "ayuda:", "analisis:"]): continue
         para = doc.add_paragraph()
-        
         if "[PISTA]" in linea or "💡" in linea:
             run_p = para.add_run(f"💡 PISTA: {linea.replace('[PISTA]', '').replace('💡', '').strip()}")
             run_p.font.color.rgb, run_p.italic = color_pista, True
             continue
-
         if "[CUADRICULA]" in linea:
-            for _ in range(2):
-                doc.add_paragraph().add_run(" " + "." * 70).font.color.rgb = RGBColor(215, 215, 215)
+            for _ in range(2): doc.add_paragraph().add_run(" " + "." * 70).font.color.rgb = RGBColor(215, 215, 215)
             continue
-
         es_titulo = (len(linea) < 55 and not linea.endswith('.')) or "[TITULO]" in linea
-        linea_final = linea.replace("[TITULO]", "").strip()
-        partes = linea_final.split("**")
+        partes = linea.replace("[TITULO]", "").strip().split("**")
         for i, parte in enumerate(partes):
             run_part = para.add_run(parte)
             if i % 2 != 0: run_part.bold = True
-            if es_titulo:
-                run_part.bold, run_part.font.size, run_part.font.color.rgb = True, Pt(13), color_inst
+            if es_titulo: run_part.bold, run_part.font.size, run_part.font.color.rgb = True, Pt(13), color_inst
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -93,7 +91,14 @@ def crear_docx(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     return bio
 
 # 3. INTERFAZ
-st.title("Motor Pedagógico v7.3 🎓")
+st.title("Motor Pedagógico v7.5 🎓")
+
+if MODELOS_VALIDOS:
+    st.sidebar.success(f"Modelos detectados: {len(MODELOS_VALIDOS)}")
+    with st.sidebar.expander("Ver modelos disponibles"):
+        for m in MODELOS_VALIDOS: st.write(f"- {m}")
+else:
+    st.error("No se detectaron modelos disponibles. Revisa tu facturación o API Key.")
 
 try:
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
@@ -130,27 +135,23 @@ try:
                 success = False
                 errores_alumno = []
 
-                for m_name in MODELOS_CASCADA:
+                for m_name in MODELOS_VALIDOS:
                     if success: break
-                    # Intentar hasta 2 veces por modelo si es error de cuota
-                    for intento in range(2):
-                        try:
-                            time.sleep(2) 
-                            m_gen = genai.GenerativeModel(m_name)
-                            res = m_gen.generate_content(f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN:\n{texto_base}")
-                            
-                            doc_final = crear_docx(res.text, nombre, diag, grupo, logo_bytes)
-                            zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_final.getvalue())
-                            success, procesados_ok = True, procesados_ok + 1
-                            break
-                        except Exception as e:
-                            err_str = str(e)
-                            if "429" in err_str:
-                                status.warning(f"Saturación. Esperando 30s para {nombre}...")
-                                time.sleep(30)
-                            else:
-                                errores_alumno.append(f"{m_name}: {err_str[:150]}")
-                                break 
+                    try:
+                        time.sleep(5) # Enfriamiento RPM
+                        m_gen = genai.GenerativeModel(m_name)
+                        res = m_gen.generate_content(f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN:\n{texto_base}")
+                        
+                        doc_final = crear_docx(res.text, nombre, diag, grupo, logo_bytes)
+                        zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_final.getvalue())
+                        success, procesados_ok = True, procesados_ok + 1
+                    except Exception as e:
+                        err_str = str(e)
+                        if "429" in err_str:
+                            status.warning(f"Límite en {m_name}. Saltando...")
+                            time.sleep(10)
+                        else:
+                            errores_alumno.append(f"{m_name}: {err_str[:100]}")
                 
                 if not success: debug_logs.append({"alumno": nombre, "errores": errores_alumno})
                 progreso.progress((i + 1) / len(alumnos_grado))
@@ -164,7 +165,6 @@ try:
                 for log in debug_logs:
                     st.warning(f"Alumno: {log['alumno']}")
                     for err in log['errores']: st.write(f"- {err}")
-                    st.divider()
 
 except Exception as e:
     st.error(f"Error general: {e}")
