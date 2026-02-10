@@ -4,38 +4,37 @@ import pandas as pd
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import PyPDF2
 import io
 import zipfile
 import time
 
-# ----------------------------
-# 1. Configuración de API y ID de Planilla
-# ----------------------------
-# Reemplaza con tu ID de planilla real
+# 1. IDENTIFICADOR DE PLANILLA (Asegúrate que sea el correcto)
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 
+# 2. CONFIGURACIÓN DE IA
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
     model = genai.GenerativeModel('gemini-2.0-flash')
-except Exception as e:
-    st.error("Error al configurar la API Key en Streamlit Secrets.")
+except:
+    st.error("Revisa la API KEY en los Secrets de Streamlit.")
 
-SYSTEM_PROMPT = """Actúa como un diseñador editorial pedagógico. Tu misión es adecuar exámenes de primaria.
-REGLAS ESTÉTICAS:
-1. No escribas introducciones. Empieza directo en el examen.
-2. MANTÉN la numeración original y la jerarquía de títulos.
-3. IMÁGENES: Escribe [MANTENER IMAGEN AQUÍ] donde el texto original las mencione.
-4. Si el ejercicio es de completar, usa líneas de puntos: ........................
+SYSTEM_PROMPT = """Eres un Diseñador Instruccional Pedagógico. Tu misión es adaptar exámenes para primaria.
+REGLAS DE DISEÑO:
+1. Sin introducciones. Empieza con el título del examen.
+2. MANTÉN la numeración original (1, 1.a, 2...).
+3. ICONOGRAFÍA: Si es Dislexia, usa [LECTURA] antes de textos largos. Si es Discalculia, usa [CÁLCULO] antes de operaciones.
+4. MANTÉN referencias a imágenes con: [VER IMAGEN/GRÁFICO AQUÍ].
+5. Si es completar, usa: ................................
 
-ADECUACIONES SEGÚN PERFIL:
-- DISLEXIA/DISCALCULIA: Frases cortas. Negrita SOLO en verbos de consigna. 
-- TDAH: Una consigna por párrafo. Pasos numerados.
-- GRUPO A: Simplifica sintaxis sin perder el objetivo pedagógico."""
+ADECUACIONES:
+- DISLEXIA: Frases cortas, vocabulario simple, verbos en negrita.
+- DISCALCULIA: Datos en listas, espacios muy amplios para resolver.
+- TDAH: Instrucciones de un solo paso. Dividir tareas largas."""
 
-# ----------------------------
-# 2. Funciones de Maquetación y Formato
-# ----------------------------
+# 3. FUNCIONES TÉCNICAS
 def extraer_texto(archivo):
     ext = archivo.name.split('.')[-1].lower()
     if ext == 'docx':
@@ -49,32 +48,36 @@ def extraer_texto(archivo):
 def crear_docx_premium(texto_ia, nombre, diagnostico, logo_bytes=None):
     doc = Document()
     diag = str(diagnostico).lower()
-    color_institucional = RGBColor(31, 73, 125)
+    color_inst = RGBColor(31, 73, 125) # Azul Institucional
 
-    # Encabezado con Tabla para Estética
-    section = doc.sections[0]
+    # --- ENCABEZADO ESTÉTICO ---
     table = doc.add_table(rows=1, cols=2)
     table.columns[0].width = Inches(1.5)
     
+    # Celda Logo
     if logo_bytes:
         try:
             run_logo = table.rows[0].cells[0].paragraphs[0].add_run()
-            run_logo.add_picture(io.BytesIO(logo_bytes), width=Inches(1.0))
-        except:
-            pass # Si el logo falla, continúa sin él
+            run_logo.add_picture(io.BytesIO(logo_bytes), width=Inches(1.2))
+        except: pass
     
-    datos_cell = table.rows[0].cells[1]
-    p_datos = datos_cell.paragraphs[0]
-    p_datos.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run_datos = p_datos.add_run(f"ESTUDIANTE: {nombre.upper()}\nEVALUACIÓN ADAPTADA")
-    run_datos.bold = True
-    run_datos.font.color.rgb = color_institucional
+    # Celda Info Alumno
+    cell_info = table.rows[0].cells[1]
+    p = cell_info.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = p.add_run(f"ESTUDIANTE: {nombre.upper()}\nEVALUACIÓN ADAPTADA")
+    run.bold = True
+    run.font.color.rgb = color_inst
+    run.font.size = Pt(12)
 
-    # --- CONFIGURACIÓN DE FUENTE OPENDYSLEXIC ---
+    doc.add_paragraph() # Espacio
+
+    # --- LÓGICA DE FUENTE ACCESIBLE ---
     style = doc.styles['Normal']
     font = style.font
+    # Prioridad OpenDyslexic (requiere instalación en PC destino)
     if "dislexia" in diag or "discalculia" in diag:
-        font.name = 'OpenDyslexic' # Debe estar instalada en la PC que imprime
+        font.name = 'OpenDyslexic'
         font.size = Pt(12)
         style.paragraph_format.line_spacing = 1.5
     else:
@@ -82,56 +85,62 @@ def crear_docx_premium(texto_ia, nombre, diagnostico, logo_bytes=None):
         font.size = Pt(11)
         style.paragraph_format.line_spacing = 1.15
 
+    # --- PROCESAMIENTO DE TEXTO ---
     for linea in texto_ia.split('\n'):
         linea = linea.strip()
         if not linea: continue
         
         para = doc.add_paragraph()
-        es_titulo = len(linea) < 60 and not linea.endswith('.')
+        
+        # Iconos visuales según contexto
+        if "[LECTURA]" in linea: linea = "📖 " + linea.replace("[LECTURA]", "")
+        if "[CÁLCULO]" in linea: linea = "🔢 " + linea.replace("[CÁLCULO]", "")
+        
+        # Títulos
+        es_titulo = (len(linea) < 60 and not linea.endswith('.')) or linea.isupper()
         
         partes = linea.split("**")
         for i, parte in enumerate(partes):
-            run = para.add_run(parte)
-            if i % 2 != 0: run.bold = True
+            run_p = para.add_run(parte)
+            if i % 2 != 0: run_p.bold = True
+            
             if es_titulo:
-                run.bold = True
-                run.font.size = Pt(14)
-                run.font.color.rgb = color_institucional
+                run_p.bold = True
+                run_p.font.size = Pt(14)
+                run_p.font.color.rgb = color_inst
+                para.space_before = Pt(12)
 
-        # Guía visual para Discalculia
+        # Espaciado extra para Discalculia (Cuadrícula visual sutil)
         if "discalculia" in diag and any(c.isdigit() for c in linea):
-            doc.add_paragraph("\n" + "." * 70).runs[0].font.color.rgb = RGBColor(210, 210, 210)
+            for _ in range(2):
+                p_espacio = doc.add_paragraph()
+                p_espacio.add_run(" " + "." * 60).font.color.rgb = RGBColor(220, 220, 220)
 
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio
 
-# ----------------------------
-# 3. Interfaz de Usuario
-# ----------------------------
-st.title("Motor Pedagógico v4.2 🍎")
+# 4. INTERFAZ DE USUARIO
+st.title("Motor de Adecuación v5.0 Premium 🎓")
 
 try:
-    # Carga de Planilla
     SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
     df = pd.read_csv(SHEET_URL)
     df.columns = [c.strip() for c in df.columns]
     
-    col_grado = df.columns[1]
-    col_nombre = df.columns[2]
-    col_emergente = df.columns[4]
-
-    grado = st.sidebar.selectbox("Grado:", df[col_grado].unique())
-    alumnos = df[(df[col_grado] == grado) & (df[col_emergente].str.lower() != "ninguna")]
+    idx_grado, idx_nombre, idx_emergente = 1, 2, 4
     
-    st.sidebar.info(f"Alumnos en {grado}: {len(alumnos)}")
-    logo_file = st.sidebar.file_uploader("Subir Logo Escuela", type=["png", "jpg"])
+    grado = st.sidebar.selectbox("Seleccione Grado:", df.iloc[:, idx_grado].unique())
+    logo_file = st.sidebar.file_uploader("Subir Logo Colegio", type=["png", "jpg"])
     logo_bytes = logo_file.read() if logo_file else None
+    
+    alumnos = df[(df.iloc[:, idx_grado] == grado) & (df.iloc[:, idx_emergente].str.lower() != "ninguna")]
+    st.sidebar.metric("Alumnos a adecuar", len(alumnos))
 
-    archivo_base = st.file_uploader("Subir Examen Base (DOCX o PDF)", type=["docx", "pdf"])
+    archivo_base = st.file_uploader("Subir Examen (DOCX o PDF)", type=["docx", "pdf"])
 
-    if archivo_base and st.button(f"Generar carpeta para {grado}"):
+    if archivo_base and st.button(f"Generar exámenes para todo {grado}"):
         texto_base = extraer_texto(archivo_base)
         zip_buffer = io.BytesIO()
         
@@ -139,35 +148,32 @@ try:
             progreso = st.progress(0)
             status = st.empty()
             
-            for i, (_, fila) in enumerate(alumnos.iterrows()):
-                nombre, diag = fila[col_nombre], fila[col_emergente]
-                status.text(f"Procesando: {nombre}...")
+            for i, (idx, fila) in enumerate(alumnos.iterrows()):
+                nombre = fila.iloc[idx_nombre]
+                diag = fila.iloc[idx_emergente]
                 
-                prompt = f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag})\n\nEXAMEN:\n{texto_base}"
+                status.text(f"Adecuando para: {nombre}...")
                 
-                # --- MANEJO DE ERROR 429 Y REINTENTOS ---
-                exito = False
-                intentos = 0
-                while not exito and intentos < 3:
+                # Manejo de Reintentos para Error 429
+                success = False
+                for intento in range(3):
                     try:
-                        time.sleep(1 + intentos * 2) # Pausa mínima
+                        time.sleep(2 + (intento * 3))
+                        prompt = f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag})\n\nEXAMEN ORIGINAL:\n{texto_base}"
                         response = model.generate_content(prompt)
+                        
                         doc_bytes = crear_docx_premium(response.text, nombre, diag, logo_bytes)
                         zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_bytes.getvalue())
-                        exito = True
+                        success = True
+                        break
                     except Exception as e:
-                        if "429" in str(e):
-                            intentos += 1
-                            status.warning(f"Límite excedido para {nombre}. Reintentando ({intentos}/3)...")
-                            time.sleep(10 * intentos) # Espera mayor si hay saturación
-                        else:
-                            st.error(f"Fallo crítico con {nombre}: {e}")
-                            break
+                        if "429" in str(e): continue
+                        else: st.error(f"Error con {nombre}: {e}"); break
                 
                 progreso.progress((i + 1) / len(alumnos))
         
-        st.success(f"Finalizado. Procesados {len(alumnos)} alumnos.")
-        st.download_button("Descargar ZIP de Adecuaciones", zip_buffer.getvalue(), f"Examenes_{grado}.zip")
+        st.success("¡Proceso completado con éxito!")
+        st.download_button("⬇️ Descargar Archivo ZIP", zip_buffer.getvalue(), f"Adecuaciones_{grado}.zip")
 
 except Exception as e:
     st.error(f"Error técnico: {e}")
