@@ -11,15 +11,15 @@ import re
 
 # 1. CONFIGURACIÓN ESTRUCTURAL
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
-# Nombres de modelos verificados para evitar el error 404
-MODELOS_CASCADA = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+# Nombres corregidos para evitar el error 404
+MODELOS_CASCADA = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"]
 
-st.set_page_config(page_title="Motor Pedagógico v7.2", layout="wide")
+st.set_page_config(page_title="Motor Pedagógico v7.3", layout="wide")
 
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 except Exception as e:
-    st.error("Error: No se encontró la API KEY en los Secrets.")
+    st.error("Error: Configura la API KEY en los Secrets.")
 
 SYSTEM_PROMPT = """Eres un Psicopedagogo experto. Genera la adecuación FINAL del examen.
 
@@ -28,7 +28,7 @@ REGLAS DE ANDAMIAJE:
 2. RESALTE: Marca en **negrita** la información nuclear del texto que responde a las preguntas. NO resaltes conectores.
 
 REGLAS DE LIMPIEZA:
-1. PROHIBIDO: No incluyas introducciones, análisis ni explicaciones técnicas.
+1. PROHIBIDO: No incluyas intros ni análisis técnicos.
 2. ESPACIOS: Usa [CUADRICULA] solo donde el alumno deba escribir (máx 2 líneas)."""
 
 # 2. FUNCIONES TÉCNICAS
@@ -93,7 +93,7 @@ def crear_docx(texto_ia, nombre, diagnostico, grupo, logo_bytes=None):
     return bio
 
 # 3. INTERFAZ
-st.title("Motor Pedagógico v7.2 🎓")
+st.title("Motor Pedagógico v7.3 🎓")
 
 try:
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
@@ -132,21 +132,25 @@ try:
 
                 for m_name in MODELOS_CASCADA:
                     if success: break
-                    try:
-                        time.sleep(2) # Pausa entre modelos
-                        m_gen = genai.GenerativeModel(m_name)
-                        res = m_gen.generate_content(f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN:\n{texto_base}")
-                        
-                        doc_final = crear_docx(res.text, nombre, diag, grupo, logo_bytes)
-                        zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_final.getvalue())
-                        success, procesados_ok = True, procesados_ok + 1
-                    except Exception as e:
-                        err_str = str(e)
-                        errores_alumno.append(f"{m_name}: {err_str[:100]}")
-                        if "429" in err_str:
-                            status.warning(f"Límite alcanzado. Esperando 20s para {nombre}...")
-                            time.sleep(20) # Pausa larga por error 429
-                        continue
+                    # Intentar hasta 2 veces por modelo si es error de cuota
+                    for intento in range(2):
+                        try:
+                            time.sleep(2) 
+                            m_gen = genai.GenerativeModel(m_name)
+                            res = m_gen.generate_content(f"{SYSTEM_PROMPT}\n\nPERFIL: {nombre} ({diag}, Grupo {grupo})\n\nEXAMEN:\n{texto_base}")
+                            
+                            doc_final = crear_docx(res.text, nombre, diag, grupo, logo_bytes)
+                            zip_f.writestr(f"Adecuacion_{nombre.replace(' ', '_')}.docx", doc_final.getvalue())
+                            success, procesados_ok = True, procesados_ok + 1
+                            break
+                        except Exception as e:
+                            err_str = str(e)
+                            if "429" in err_str:
+                                status.warning(f"Saturación. Esperando 30s para {nombre}...")
+                                time.sleep(30)
+                            else:
+                                errores_alumno.append(f"{m_name}: {err_str[:150]}")
+                                break 
                 
                 if not success: debug_logs.append({"alumno": nombre, "errores": errores_alumno})
                 progreso.progress((i + 1) / len(alumnos_grado))
