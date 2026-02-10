@@ -9,97 +9,68 @@ import io
 import zipfile
 import time
 import random
-import re
-import unicodedata
 
-# 1. CONFIGURACIÓN DE SEGURIDAD Y CONEXIÓN
-st.set_page_config(page_title="Motor Pedagógico v11.5 🚀", layout="wide")
-SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
+# 1. SETUP DE SEGURIDAD (Para que no bloquee textos escolares)
+st.set_page_config(page_title="Motor Pedagógico v12 🍎", layout="wide")
+try:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    SAFETY = {category: HarmBlockThreshold.BLOCK_NONE for category in HarmCategory}
+    # Detección de modelo para evitar el error 404
+    modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    MODELO_IA = next((m for m in modelos if "1.5-flash" in m), modelos[0])
+except:
+    st.error("Error de configuración de API.")
 
-# Bypass de Seguridad: Evita bloqueos en contenidos escolares (falsos positivos)
-SAFETY_SETTINGS = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-}
+# 2. EL PROMPT DE TUTOR (El corazón del cambio)
+SYSTEM_PROMPT = """Actúa como un Tutor Psicopedagogo que está al lado del alumno.
+Tu objetivo es intervenir el examen para que sea comprensible, motivador y justo.
 
-# 2. UTILIDADES DE ROBUSTEZ (Detección de Columnas y Reintentos)
-def nrm(s: str) -> str:
-    s = str(s or "").strip()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s.lower()
+REGLAS DE ORO:
+1. TRANSCRIBE TODO: No resumas. Si el examen tiene 7 puntos, el resultado debe tener 7 puntos.
+2. NO RESUELVAS: El alumno debe trabajar. Deja los espacios vacíos que el docente puso.
+3. RAZONA LA PISTA 💡: Antes de escribir la pista, resuelve el ejercicio vos. 
+   - Si es 4x6, la pista debe apuntar al proceso: "💡 Si sumas 4 veces el 6, ¿cuánto te da?".
+4. LENGUAJE AMIGABLE: Usa emojis (🔢, 📖, ✍️) y un tono que anime al chico.
+5. IMÁGENES: Inserta  para que el alumno "vea" el problema.
+   - Para Discalculia: Usa objetos concretos (bolitas, lápices).
+   - Para Dislexia: Pictogramas de la acción (alguien leyendo, alguien uniendo)."""
 
-def with_backoff(call, max_tries=6):
-    """Estrategia de reintento exponencial para eliminar el error 429."""
-    for attempt in range(max_tries):
-        try:
-            return call()
-        except Exception as e:
-            if "429" in str(e) and attempt < max_tries - 1:
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(wait)
-                continue
-            raise e
-
-# 3. PROMPT MAESTRO DE RAZONAMIENTO (Cerebro de la IA)
-SYSTEM_PROMPT = """Actúa como un Especialista en Neurodiversidad y Diseñador Instruccional. 
-Tu misión es INTERVENIR el examen original para que el alumno pueda razonar la respuesta.
-
-PROCESO DE PENSAMIENTO OBLIGATORIO:
-1. ANALIZA: ¿Qué se evalúa en este ejercicio? (Ej: Multiplicación, Comprensión Lectora).
-2. RAZONA: Resuelve tú mismo el ejercicio internamente.
-3. ADECUACIÓN POR GRUPO:
-   - GRUPO A (Andamiaje Intenso): El alumno requiere apoyos visuales y lenguaje ultra-simple. Usa ejemplos de la vida real.
-   - GRUPO B (Andamiaje Moderado): Pistas de proceso. Divide tareas largas en pasos.
-   - GRUPO C (Metacognición): Desafíos para evitar el aburrimiento. Pistas de revisión.
-
-REGLAS DE DISEÑO:
-- EMOJIS: Usa iconos como anclas visuales (🔢 Matemática, 📖 Lectura, ✍️ Escribir).
-- PISTAS 💡: Deben ser de razonamiento, nunca des la respuesta.
-- IMÁGENES: Usa la etiqueta  para representar el proceso mental.
-- RESALTE: **Negrita** solo en datos y verbos de acción. No resaltes conectores.
-- SILENCIO: Prohibido saludar o dar introducciones como "Aquí tienes el examen"."""
-
-# 4. FUNCIONES DE GENERACIÓN DE CONTENIDO
-def generar_imagen_ia(descripcion):
+# 3. MOTOR DE GENERACIÓN
+def generar_imagen(desc):
     try:
-        model = genai.GenerativeModel("imagen-3.0")
-        res = model.generate_content(f"Estilo dibujo escolar, fondo blanco, minimalista: {descripcion}", safety_settings=SAFETY_SETTINGS)
+        m = genai.GenerativeModel("imagen-3.0")
+        res = m.generate_content(f"Dibujo escolar simple, fondo blanco, estilo pictograma: {desc}", safety_settings=SAFETY)
         return io.BytesIO(res.candidates[0].content.parts[0].inline_data.data)
     except: return None
 
-def crear_docx_v11(texto_ia, nombre, diagnostico, grupo, logo_bytes, gen_img):
+def crear_examen_v12(texto_ia, nombre, diag, grupo, logo, gen_img):
     doc = Document()
-    diag, grupo_v = str(diagnostico).lower(), str(grupo).upper()
-    color_inst, color_pista = RGBColor(31, 73, 125), RGBColor(0, 102, 0)
-
-    # Header Fiel al Motor
+    color_pista = RGBColor(0, 102, 0) # Verde pedagógico
+    
+    # Encabezado limpio
     table = doc.add_table(rows=1, cols=2)
-    if logo_bytes:
-        try: table.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo_bytes), width=Inches(1.0))
-        except: pass
+    if logo:
+        table.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo), width=Inches(1.0))
     p = table.rows[0].cells[1].paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    p.add_run(f"ALUMNO: {nombre.upper()}\nAPOYO: {diagnostico.upper()} | GRUPO: {grupo_v}").bold = True
+    p.add_run(f"ALUMNO: {nombre.upper()}\nAPOYO: {diag.upper()} | GRUPO: {grupo.upper()}").bold = True
 
-    is_apo = any(x in diag for x in ["dislexia", "discalculia", "general"]) or grupo_v == "A"
+    # Fuente Inclusiva
+    is_apo = any(x in str(diag).lower() for x in ["dislexia", "discalculia"]) or "A" in str(grupo)
     
-    # Limpieza de "charla" de la IA
-    texto_filtrado = re.sub(r"^(¡Claro|Hola|Aquí tienes|Entendido|Como maquetador).*?\n", "", texto_ia, flags=re.IGNORECASE)
+    # Limpiar basura de la IA
+    texto_ia = re.sub(r"^(¡Claro|Hola|Aquí|Entendido).*?\n", "", texto_ia, flags=re.IGNORECASE)
 
-    for linea in texto_filtrado.split('\n'):
+    for linea in texto_ia.split('\n'):
         linea = linea.strip()
         if not linea or "análisis:" in linea.lower(): continue
 
         if "[IMAGEN:" in linea and gen_img:
-            desc = linea.split("[IMAGEN:")[1].split("]")[0]
-            img_bytes = generar_imagen_ia(desc)
-            if img_bytes:
-                para_i = doc.add_paragraph()
-                para_i.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                para_i.add_run().add_picture(img_bytes, width=Inches(2.5))
+            img_data = generar_imagen(linea.split("[IMAGEN:")[1].split("]")[0])
+            if img_data:
+                pic = doc.add_paragraph()
+                pic.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                pic.add_run().add_picture(img_data, width=Inches(2.5))
             continue
 
         para = doc.add_paragraph()
@@ -113,64 +84,48 @@ def crear_docx_v11(texto_ia, nombre, diagnostico, grupo, logo_bytes, gen_img):
                 if i % 2 != 0: run.bold = True
                 run.font.name = 'OpenDyslexic' if is_apo else 'Verdana'
                 run.font.size = Pt(12 if is_apo else 11)
-
+    
     bio = io.BytesIO()
     doc.save(bio)
     return bio
 
-# 5. LÓGICA DE INTERFAZ Y PROCESAMIENTO
+# 4. INTERFAZ (Simple y Directa)
 try:
-    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    # Escaneo de modelos para evitar Error 404
-    modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    MODELO_IA = next((m for m in modelos if "gemini-1.5-flash" in m), modelos[0])
-
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-    df = pd.read_csv(url)
+    df = pd.read_csv(f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv")
     df.columns = [c.strip() for c in df.columns]
     
-    # Detección inteligente de columnas
-    col_grado = [c for c in df.columns if "grado" in nrm(c)][0]
-    col_nombre = [c for c in df.columns if "nombre" in nrm(c)][0]
-    col_casos = [c for c in df.columns if "casos" in nrm(c) or "emergente" in nrm(c)][0]
-    col_grupo = [c for c in df.columns if "grupo" in nrm(c)][0]
-
-    st.sidebar.header("🎯 Selección de Alumnos")
-    grado_sel = st.sidebar.selectbox("Grado:", df[col_grado].unique())
-    df_grado = df[df[col_grado] == grado_sel]
+    grado = st.sidebar.selectbox("Grado:", df[df.columns[1]].unique())
+    alcance = st.sidebar.radio("Adecuar:", ["Todo el grado", "Elegir alumnos"])
     
-    alcance = st.sidebar.radio("¿A quiénes adecuar?", ["Todos los alumnos", "Seleccionar cuáles"])
-    alumnos_final = df_grado if alcance == "Todos los alumnos" else df_grado[df_grado[col_nombre].isin(st.sidebar.multiselect("Elige los alumnos:", df_grado[col_nombre].tolist()))]
+    df_f = df[df[df.columns[1]] == grado]
+    if alcance == "Elegir alumnos":
+        sel = st.sidebar.multiselect("Alumnos:", df_f[df_f.columns[2]].tolist())
+        df_f = df_f[df_f[df_f.columns[2]].isin(sel)]
 
-    st.sidebar.divider()
-    activar_img = st.sidebar.checkbox("Generar Apoyos Visuales 🖼️", value=True)
+    activar_img = st.sidebar.checkbox("Generar Imágenes", value=True)
     logo_file = st.sidebar.file_uploader("Logo Colegio", type=["png", "jpg"])
     logo_bytes = logo_file.read() if logo_file else None
-    archivo_base = st.file_uploader("Examen Original (docx)", type=["docx"])
+    archivo = st.file_uploader("Subir Examen (docx)", type=["docx"])
 
-    if archivo_base and not alumnos_final.empty and st.button("🚀 Iniciar Procesamiento v11.5"):
+    if archivo and st.button("🚀 GENERAR EXÁMENES"):
         from docx import Document as DocRead
-        texto_base = "\n".join([p.text for p in DocRead(archivo_base).paragraphs])
-        zip_buffer = io.BytesIO()
+        txt_base = "\n".join([p.text for p in DocRead(archivo).paragraphs])
+        zip_bio = io.BytesIO()
         
-        with zipfile.ZipFile(zip_buffer, "w") as zip_f:
-            progreso = st.progress(0)
-            for i, (_, fila) in enumerate(alumnos_final.iterrows()):
-                n, d, g = str(fila[col_nombre]), str(fila[col_casos]), str(fila[col_grupo])
-                try:
-                    def llamar_ia():
-                        m = genai.GenerativeModel(MODELO_IA)
-                        return m.generate_content(f"{SYSTEM_PROMPT}\nALUMNO: {n} ({d}, Grupo {g})\nEXAMEN:\n{texto_base}", safety_settings=SAFETY_SETTINGS)
-                    
-                    res = with_backoff(llamar_ia)
-                    doc_res = crear_docx_v11(res.text, n, d, g, logo_bytes, activar_img)
-                    zip_f.writestr(f"Adecuacion_{n.replace(' ', '_')}.docx", doc_res.getvalue())
-                except Exception as e:
-                    st.sidebar.error(f"Fallo en {n}: {e}")
-                progreso.progress((i + 1) / len(alumnos_final))
+        with zipfile.ZipFile(zip_bio, "w") as z:
+            prog = st.progress(0)
+            for i, (_, fila) in enumerate(df_f.iterrows()):
+                n, g, d = str(fila[df.columns[2]]), str(fila[df.columns[3]]), str(fila[df.columns[4]])
+                
+                # Llamada con reintento automático si falla
+                m = genai.GenerativeModel(MODELO_IA)
+                res = m.generate_content(f"{SYSTEM_PROMPT}\nALUMNO: {n} ({d}, {g})\nEXAMEN:\n{txt_base}", safety_settings=SAFETY)
+                
+                doc_res = crear_examen_v12(res.text, n, d, g, logo_bytes, activar_img)
+                z.writestr(f"Adecuacion_{n.replace(' ', '_')}.docx", doc_res.getvalue())
+                prog.progress((i + 1) / len(df_f))
 
-        st.success("Lote completado exitosamente.")
-        st.download_button("📥 Descargar ZIP", zip_buffer.getvalue(), f"Adecuaciones_{grado_sel}.zip")
-
+        st.success("¡Hecho!")
+        st.download_button("📥 Descargar Todo", zip_bio.getvalue(), "Examenes.zip")
 except Exception as e:
-    st.error(f"Fallo técnico: {e}")
+    st.error(f"Error: {e}")
