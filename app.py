@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import google.generativeai as genai
 
@@ -14,19 +15,20 @@ from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# ============================================================
+# =========================
 # CONFIG
-# ============================================================
-st.set_page_config(page_title="Motor Pedagógico Determinista v13.1", layout="wide")
+# =========================
+st.set_page_config(page_title="Motor Pedagógico Determinista v13.3", layout="wide")
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
-# Modelos (configurables)
 MODEL_TEXT_DEFAULT = "gemini-1.5-flash"
-MODEL_IMAGE_DEFAULT = "imagen-3.0"  # Debe ser configurable: puede no existir en tu cuenta.
 
-# Determinismo (parcial; el modelo puede no ser bit-a-bit determinista)
+# IMPORTANT: El ID real de imagen depende de tu plataforma/entitlement.
+# Dejalo configurable y validalo. No asumas que "imagen-3.0" existe.
+MODEL_IMAGE_DEFAULT = "imagen-3.0"
+
 GEN_CFG_JSON = {
     "response_mime_type": "application/json",
     "temperature": 0,
@@ -35,7 +37,6 @@ GEN_CFG_JSON = {
     "max_output_tokens": 4096,
 }
 
-# Safety (educación: más restrictivo que lo que tenías)
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -43,19 +44,16 @@ SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
-# Retry
 RETRIES = 6
 BACKOFF_BASE_SECONDS = 1.0
-
-# Cache (Streamlit)
 CACHE_TTL_SECONDS = 6 * 60 * 60  # 6h
 
-# ============================================================
-# OPTIONAL: Pydantic validation if available
-# ============================================================
+# =========================
+# OPTIONAL: Pydantic
+# =========================
 PYDANTIC_AVAILABLE = False
 try:
-    from pydantic import BaseModel, Field, ValidationError
+    from pydantic import BaseModel, Field
 
     class VisualModel(BaseModel):
         habilitado: bool = Field(...)
@@ -81,16 +79,16 @@ except Exception:
     PYDANTIC_AVAILABLE = False
 
 
-# ============================================================
-# UTILITIES
-# ============================================================
+# =========================
+# Helpers
+# =========================
 def get_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def _is_retryable_error(e: Exception) -> bool:
     s = str(e).lower()
-    retry_markers = [
+    markers = [
         "429",
         "rate",
         "quota",
@@ -107,7 +105,7 @@ def _is_retryable_error(e: Exception) -> bool:
         "temporarily",
         "connection reset",
     ]
-    return any(m in s for m in retry_markers)
+    return any(m in s for m in markers)
 
 
 def retry_with_backoff(fn, retries: int = RETRIES, backoff_in_seconds: float = BACKOFF_BASE_SECONDS):
@@ -144,21 +142,20 @@ def normalize_visual(v: Any) -> Dict[str, Any]:
     habil = normalize_bool(v.get("habilitado", False))
     prompt = v.get("prompt")
     if not isinstance(prompt, str):
-        prompt = None
+        prompt = ""
     if not habil:
         return {"habilitado": False}
-    return {"habilitado": True, "prompt": prompt or ""}
+    return {"habilitado": True, "prompt": prompt.strip()}
 
 
 def basic_schema_validate_and_normalize(data: Any) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     errors: List[str] = []
     if not isinstance(data, dict):
         return None, ["Root debe ser un objeto JSON."]
-    if "alumno" not in data or "documento" not in data:
-        return None, ["Faltan claves: alumno/documento."]
 
     alumno = data.get("alumno")
     documento = data.get("documento")
+
     if not isinstance(alumno, dict):
         errors.append("alumno debe ser objeto.")
         alumno = {}
@@ -182,6 +179,7 @@ def basic_schema_validate_and_normalize(data: Any) -> Tuple[Optional[Dict[str, A
         if not isinstance(it, dict):
             errors.append(f"documento[{idx}] debe ser objeto.")
             continue
+
         tipo = it.get("tipo", "consigna")
         enun = it.get("enunciado_original", "")
         pista = it.get("pista", "")
@@ -204,24 +202,19 @@ def basic_schema_validate_and_normalize(data: Any) -> Tuple[Optional[Dict[str, A
         )
 
     normalized = {
-        "alumno": {
-            "nombre": str(nombre),
-            "grupo": str(grupo),
-            "diagnostico": str(diagnostico),
-        },
+        "alumno": {"nombre": str(nombre), "grupo": str(grupo), "diagnostico": str(diagnostico)},
         "documento": norm_doc,
     }
     return normalized, errors
 
 
-# ============================================================
-# DOCX EXTRACTION (paragraphs + tables in body order)
-# ============================================================
+# =========================
+# DOCX extraction (paragraphs + tables in body order)
+# =========================
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def _extract_text_from_element(el) -> str:
-    # Concatenate all w:t within this element
     parts = []
     for node in el.iter():
         if node.tag == f"{W_NS}t" and node.text:
@@ -230,42 +223,77 @@ def _extract_text_from_element(el) -> str:
 
 
 def extraer_contenido_completo(file) -> str:
-    """
-    Extrae párrafos y tablas respetando el orden del body.
-    Nota: no incluye headers/footers ni imágenes.
-    """
     doc = Document(file)
     contenido: List[str] = []
 
     for element in doc.element.body:
-        # Paragraph
         if element.tag == f"{W_NS}p":
             text = _extract_text_from_element(element)
             if text:
                 contenido.append(text)
-        # Table
         elif element.tag == f"{W_NS}tbl":
-            # iterate rows
             for row in element.findall(f".//{W_NS}tr"):
                 row_cells = []
                 for cell in row.findall(f".//{W_NS}tc"):
                     cell_text = _extract_text_from_element(cell)
                     row_cells.append(cell_text)
-                # Use TAB separator to keep reading simple; pipe also ok
                 line = "\t".join([c for c in row_cells if c is not None])
                 if line.strip():
                     contenido.append(line.strip())
-            # spacer between tables
-            contenido.append("")
+            contenido.append("")  # spacer after table
 
     return "\n".join([c for c in contenido if c is not None]).strip()
 
 
-# ============================================================
-# GEMINI JSON GENERATION + REPAIR
-# ============================================================
+# =========================
+# Image model validation (best effort)
+# =========================
+def list_text_models() -> List[str]:
+    try:
+        ms = genai.list_models()
+        out = []
+        for m in ms:
+            methods = getattr(m, "supported_generation_methods", [])
+            if "generateContent" in methods:
+                out.append(m.name)
+        return out
+    except Exception:
+        return []
+
+
+def smoke_test_image_model(model_id: str) -> Tuple[bool, str]:
+    """
+    Valida "imagen" por prueba real:
+    - Llama al modelo con un prompt fijo.
+    - Verifica que haya inline_data bytes.
+    """
+    prompt = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: manzana"
+    try:
+        model = genai.GenerativeModel(model_id)
+
+        def _call():
+            return model.generate_content(prompt, safety_settings=SAFETY_SETTINGS)
+
+        res = retry_with_backoff(_call)
+        # Parse defensivo
+        cand = res.candidates[0]
+        part0 = cand.content.parts[0]
+        inline = getattr(part0, "inline_data", None)
+        data = getattr(inline, "data", None) if inline else None
+        if not data:
+            return False, "Respuesta sin inline_data.data (no parece ser modelo de imagen compatible)."
+        if len(data) < 500:
+            return False, f"inline_data.data demasiado chico ({len(data)} bytes)."
+        return True, f"OK (bytes={len(data)})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# =========================
+# Gemini JSON generation + repair
+# =========================
 BASE_JSON_INSTRUCTIONS = """
-Eres un experto en adecuación pedagógica. Debes devolver EXCLUSIVAMENTE un JSON válido (sin markdown, sin texto extra, sin comentarios).
+Devuelve EXCLUSIVAMENTE un JSON válido (sin markdown, sin texto extra, sin comentarios).
 
 Esquema obligatorio:
 {
@@ -274,14 +302,14 @@ Esquema obligatorio:
     {
       "tipo": "consigna",
       "enunciado_original": "texto literal completo de la consigna",
-      "pista": "pista pedagógica breve para guiar razonamiento (no dar respuesta)",
+      "pista": "pista pedagógica breve (no dar respuesta)",
       "visual": { "habilitado": boolean, "prompt": "string opcional" }
     }
   ]
 }
 
 Reglas:
-1) Incluye TODAS las consignas del examen original SIN OMITIR ninguna.
+1) Incluye TODAS las consignas del examen SIN OMITIR ninguna.
 2) enunciado_original debe ser COPIA FIEL del examen (no parafrasear).
 3) Ajusta la pista por diagnóstico y grupo. No entregues la solución.
 4) visual.habilitado:
@@ -295,7 +323,6 @@ Reglas:
 
 
 def build_prompt(nombre: str, diagnostico: str, grupo: str, examen_texto: str) -> str:
-    # Evitar variables no deterministas (ej: timestamps)
     return f"""{BASE_JSON_INSTRUCTIONS}
 
 Alumno:
@@ -325,7 +352,6 @@ Recuerda: debe cumplir EXACTAMENTE el esquema y reglas. No agregues nada fuera d
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_gemini_json(cache_key: str, model_text: str, prompt: str) -> Dict[str, Any]:
-    # cache_key exists only to allow caching; do not remove.
     model = genai.GenerativeModel(model_text)
 
     def _call():
@@ -339,21 +365,14 @@ def _cached_gemini_json(cache_key: str, model_text: str, prompt: str) -> Dict[st
     text = getattr(resp, "text", "") or ""
     data = json.loads(text)
 
-    # Validate (pydantic if possible, else basic)
     if PYDANTIC_AVAILABLE:
-        try:
-            AdecuacionModel.model_validate(data)
-            return data
-        except Exception as ve:
-            # Let caller do repair; raise with context
-            raise ValueError(f"Schema inválido (pydantic): {ve}")
-    else:
-        normalized, errs = basic_schema_validate_and_normalize(data)
-        if errs:
-            raise ValueError(f"Schema inválido: {errs[:6]}")
-        return normalized  # normalized is Dict
+        AdecuacionModel.model_validate(data)
+        return data
 
-    return data
+    normalized, errs = basic_schema_validate_and_normalize(data)
+    if errs:
+        raise ValueError(f"Schema inválido: {errs[:8]}")
+    return normalized  # type: ignore
 
 
 def solicitar_adecuacion_json(
@@ -366,12 +385,11 @@ def solicitar_adecuacion_json(
 ) -> Dict[str, Any]:
     prompt = build_prompt(nombre, diagnostico, grupo, examen_texto)
     cache_key = f"{exam_hash}::{nombre}::{grupo}::{diagnostico}::{model_text}"
+
     try:
-        data = _cached_gemini_json(cache_key, model_text, prompt)
-        return data
-    except Exception as e:
-        # Attempt repair once
-        # We need the raw response text to repair; so we call once without cache to capture it.
+        return _cached_gemini_json(cache_key, model_text, prompt)
+    except Exception:
+        # Repair once: capture raw response, validate, else repair
         model = genai.GenerativeModel(model_text)
 
         def _call_raw():
@@ -400,12 +418,10 @@ def solicitar_adecuacion_json(
                     parse_errors.append(str(ve))
             else:
                 normalized, errs = basic_schema_validate_and_normalize(parsed)
-                if errs:
-                    parse_errors.extend(errs)
-                else:
+                if not errs and normalized:
                     return normalized
+                parse_errors.extend(errs)
 
-        # Repair prompt
         repair_prompt = build_repair_prompt(raw_text, parse_errors)
 
         def _call_repair():
@@ -417,58 +433,55 @@ def solicitar_adecuacion_json(
 
         repaired = retry_with_backoff(_call_repair)
         repaired_text = getattr(repaired, "text", "") or ""
-
         data2 = json.loads(repaired_text)
+
         if PYDANTIC_AVAILABLE:
             AdecuacionModel.model_validate(data2)
             return data2
 
         normalized2, errs2 = basic_schema_validate_and_normalize(data2)
-        if errs2:
-            raise ValueError(f"JSON reparado inválido: {errs2[:8]} (original error: {e})")
+        if errs2 or not normalized2:
+            raise ValueError(f"JSON reparado inválido: {errs2[:10]}")
         return normalized2
 
 
-# ============================================================
-# IMAGE GENERATION (best effort, configurable, non-deterministic)
-# ============================================================
+# =========================
+# Image generation with validation + fallback
+# =========================
 def generar_imagen_ia(model_image: str, prompt_visual: str) -> Optional[io.BytesIO]:
-    model = genai.GenerativeModel(model_image)
-
-    def _call():
-        return model.generate_content(
-            prompt_visual,
-            # Si tu endpoint soporta safety_settings para imagen, dejalo.
-            # Si no, puede fallar. Lo mantenemos por seguridad; si falla, se atrapa.
-            safety_settings=SAFETY_SETTINGS,
-        )
-
+    """
+    Genera imagen y valida:
+    - existencia de inline_data.data
+    - tamaño mínimo de bytes
+    """
     try:
+        model = genai.GenerativeModel(model_image)
+
+        def _call():
+            return model.generate_content(prompt_visual, safety_settings=SAFETY_SETTINGS)
+
         res = retry_with_backoff(_call)
-        # Defensive parsing
         cand = res.candidates[0]
         part0 = cand.content.parts[0]
         inline = getattr(part0, "inline_data", None)
-        if not inline or not getattr(inline, "data", None):
+        data = getattr(inline, "data", None) if inline else None
+        if not data or len(data) < 500:
             return None
-        return io.BytesIO(inline.data)
+        return io.BytesIO(data)
     except Exception:
         return None
 
 
-# ============================================================
-# DOCX RENDER (deterministic from JSON)
-# ============================================================
+# =========================
+# DOCX render
+# =========================
 def renderizar_docx(data_json: Dict[str, Any], logo_bytes: Optional[bytes], gen_img_bool: bool, model_image: str) -> bytes:
     doc = Document()
 
-    # Header table
     header_table = doc.add_table(rows=1, cols=2)
-
     if logo_bytes:
         try:
-            cell_logo = header_table.rows[0].cells[0]
-            cell_logo.paragraphs[0].add_run().add_picture(io.BytesIO(logo_bytes), width=Inches(0.85))
+            header_table.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo_bytes), width=Inches(0.85))
         except Exception:
             pass
 
@@ -485,9 +498,10 @@ def renderizar_docx(data_json: Dict[str, Any], logo_bytes: Optional[bytes], gen_
     run.bold = True
     run.font.size = Pt(10)
 
-    # Body
     green = RGBColor(0, 128, 0)
     items = data_json.get("documento", []) if isinstance(data_json.get("documento"), list) else []
+
+    required_prefix = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
 
     for item in items:
         if not isinstance(item, dict):
@@ -500,13 +514,11 @@ def renderizar_docx(data_json: Dict[str, Any], logo_bytes: Optional[bytes], gen_
         if not enun:
             continue
 
-        # Enunciado
         p_orig = doc.add_paragraph()
         r1 = p_orig.add_run(enun)
         r1.font.size = Pt(11)
         p_orig.paragraph_format.space_after = Pt(3)
 
-        # Pista
         if pista:
             p_pista = doc.add_paragraph()
             r2 = p_pista.add_run(f"💡 {pista}")
@@ -515,16 +527,12 @@ def renderizar_docx(data_json: Dict[str, Any], logo_bytes: Optional[bytes], gen_
             r2.font.size = Pt(10)
             p_pista.paragraph_format.space_after = Pt(4)
 
-        # Imagen
         if gen_img_bool and visual.get("habilitado", False):
-            prompt_visual = str(visual.get("prompt", "") or "").strip()
-            # Forzar prefijo requerido si vino vacío o mal
-            required_prefix = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
-            if prompt_visual and not prompt_visual.startswith(required_prefix):
-                prompt_visual = required_prefix + prompt_visual
-
-            if prompt_visual:
-                img_data = generar_imagen_ia(model_image, prompt_visual)
+            pv = str(visual.get("prompt", "") or "").strip()
+            if pv and not pv.startswith(required_prefix):
+                pv = required_prefix + pv
+            if pv:
+                img_data = generar_imagen_ia(model_image, pv)
                 if img_data:
                     p_img = doc.add_paragraph()
                     p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -539,13 +547,13 @@ def renderizar_docx(data_json: Dict[str, Any], logo_bytes: Optional[bytes], gen_
     return out.getvalue()
 
 
-# ============================================================
-# STREAMLIT APP
-# ============================================================
+# =========================
+# UI
+# =========================
 def main():
-    st.title("Motor Pedagógico Determinista v13.1")
+    st.title("Motor Pedagógico Determinista v13.3")
 
-    # API key required
+    # Configure API key
     try:
         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
     except Exception:
@@ -560,21 +568,36 @@ def main():
         st.error(f"Error leyendo planilla CSV: {e}")
         return
 
-    # Sidebar config
+    # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuración")
 
-        # Model config
         model_text = st.text_input("Modelo texto", value=MODEL_TEXT_DEFAULT)
         model_image = st.text_input("Modelo imagen", value=MODEL_IMAGE_DEFAULT)
 
-        # Filters
+        # Model listing (best effort)
+        with st.expander("Diagnóstico modelos (best effort)"):
+            if st.button("Listar modelos visibles"):
+                models = list_text_models()
+                if not models:
+                    st.warning("No se pudieron listar modelos (o la API no los expone).")
+                else:
+                    st.code("\n".join(models))
+
+            st.caption("Validación de imagen = llamada real al modelo + verificación de inline_data.")
+            if st.button("Probar modelo de imagen actual"):
+                ok, msg = smoke_test_image_model(model_image)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+        # Column mapping (por índice como venías usando)
         grado_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
         alumno_col = df.columns[2] if len(df.columns) > 2 else df.columns[0]
         grupo_col = df.columns[3] if len(df.columns) > 3 else df.columns[0]
         diag_col = df.columns[4] if len(df.columns) > 4 else df.columns[0]
 
-        st.caption("Filtros planilla")
         grado = st.selectbox("Grado", sorted(df[grado_col].dropna().unique().tolist()))
         df_f = df[df[grado_col] == grado].copy()
 
@@ -588,20 +611,29 @@ def main():
 
         st.divider()
 
-        gen_img = st.checkbox("Generar imágenes IA", value=True)
+        # Image enablement: validate first (optional but safer)
+        gen_img_requested = st.checkbox("Generar imágenes IA", value=True)
+        img_ok = False
+        img_status = ""
+        if gen_img_requested:
+            img_ok, img_status = smoke_test_image_model(model_image)
+            if not img_ok:
+                st.warning(f"Imágenes deshabilitadas: {img_status}")
+        gen_img = gen_img_requested and img_ok
+
         logo = st.file_uploader("Logo", type=["png", "jpg", "jpeg"])
         logo_bytes = logo.read() if logo else None
 
-        st.divider()
         st.caption(f"Pydantic: {'ON' if PYDANTIC_AVAILABLE else 'OFF'}")
+        if gen_img_requested and not img_ok:
+            st.caption("Sugerencia: cambia MODEL_IMAGE por uno soportado por tu cuenta/endpoint.")
 
+    # File input
     file_base = st.file_uploader("Examen base (DOCX)", type=["docx"])
-
     if not file_base:
         return
 
     if st.button("Procesar lote"):
-        # Extract exam
         with st.spinner("Extrayendo contenido del DOCX..."):
             exam_text = extraer_contenido_completo(file_base)
         if not exam_text.strip():
@@ -610,7 +642,6 @@ def main():
 
         exam_hash = get_content_hash(exam_text)
 
-        # Process
         alumnos_data = df_f[[alumno_col, grupo_col, diag_col]].dropna(subset=[alumno_col]).copy()
         total = len(alumnos_data)
         if total == 0:
@@ -627,8 +658,7 @@ def main():
                 grupo_val = str(row[grupo_col]).strip()
                 diag_val = str(row[diag_col]).strip()
 
-                status.text(f"({i}/{total}) Generando JSON para: {nombre}")
-
+                status.text(f"({i}/{total}) JSON: {nombre}")
                 try:
                     data_json = solicitar_adecuacion_json(
                         nombre=nombre,
@@ -639,20 +669,26 @@ def main():
                         model_text=model_text,
                     )
 
-                    # Extra normalize (if pydantic not present, already normalized; if pydantic present, keep but normalize visual defensively)
-                    if not PYDANTIC_AVAILABLE:
-                        normalized, _ = basic_schema_validate_and_normalize(data_json)
-                        data_json = normalized or data_json
-
-                    status.text(f"({i}/{total}) Renderizando DOCX: {nombre}")
+                    # Render
+                    status.text(f"({i}/{total}) DOCX: {nombre}")
                     docx_bytes = renderizar_docx(data_json, logo_bytes, gen_img, model_image)
 
-                    safe_name = nombre.replace(" ", "_").replace("/", "_").replace("\\", "_")
+                    safe_name = (
+                        nombre.replace(" ", "_")
+                        .replace("/", "_")
+                        .replace("\\", "_")
+                        .replace("..", "_")
+                    )
                     zip_file.writestr(f"Adecuacion_{safe_name}.docx", docx_bytes)
 
                 except Exception as e:
-                    # Continue batch; embed an error file for traceability
-                    err_txt = f"Alumno: {nombre}\nGrupo: {grupo_val}\nDiagnóstico: {diag_val}\nError: {e}\n"
+                    # Error artifact per student
+                    err_txt = (
+                        f"Alumno: {nombre}\n"
+                        f"Grupo: {grupo_val}\n"
+                        f"Diagnóstico: {diag_val}\n"
+                        f"Error: {type(e).__name__}: {e}\n"
+                    )
                     zip_file.writestr(f"ERROR_{nombre.replace(' ', '_')}.txt", err_txt.encode("utf-8"))
 
                 bar.progress(i / total)
