@@ -9,38 +9,34 @@ import random
 import hashlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # ============================================================
-# Motor Pedagógico v14.6 (Super Robusto)
-# Estrategia: Consultar primero, ejecutar después
-# - Escaneo forzado de modelos ANTES de UI (cache_resource)
-# - Selección automática del mejor modelo de texto disponible (ranking)
-# - Selección automática del modelo de imagen (si existe) por smoke test
-# - JSON estricto (application/json) + validación + reparación 1 vez
-# - Retries con exponential backoff en errores típicos (429/5xx/timeouts)
-# - ZIP blindado: siempre incluye _REPORTE.txt y _RESUMEN.txt
-# - Error por alumno en archivo ERROR_*.txt
+# Motor Pedagógico v16.0 (Super Robusto + Diagnóstico de Parseo)
+# - Consultar primero, ejecutar después: escaneo forzado de modelos en boot
+# - Selección automática del mejor modelo de texto disponible
+# - Selección automática de modelo de imagen (si existe) por smoke test
+# - Manejo robusto de finish_reason=2 (MAX_TOKENS) y respuestas sin parts
+# - JSON estricto + reparación 1 vez + validación dura
+# - Fallback compacto automático si el JSON no entra
+# - Diagnóstico UI: Probar parseo (DOCX + JSON) antes de procesar lote
+# - ZIP blindado: siempre incluye _REPORTE.txt y _RESUMEN.txt + archivos ERROR_*.txt
 # - Render inclusivo (Verdana + interlineado) + pistas verdes
 # ============================================================
 
-st.set_page_config(page_title="Motor Pedagógico v14.6", layout="wide")
+st.set_page_config(page_title="Motor Pedagógico v16.0", layout="wide")
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
 RETRIES = 6
 CACHE_TTL_SECONDS = 6 * 60 * 60
+SMOKE_IMAGE_MIN_BYTES = 500
 
-GEN_CFG_JSON = {
-    "response_mime_type": "application/json",
-    "temperature": 0,
-    "top_p": 1,
-    "top_k": 1,
-    "max_output_tokens": 4096,
-}
+IMAGE_PROMPT_PREFIX = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
 
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -49,8 +45,20 @@ SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
+# JSON: minimiza desvíos
+BASE_GEN_CFG_JSON = {
+    "response_mime_type": "application/json",
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 1,
+}
+
+# escalado de output tokens para evitar finish_reason=2
+OUT_TOKEN_STEPS_FULL = [4096, 6144, 8192]
+OUT_TOKEN_STEPS_COMPACT = [2048, 4096]
+
 # ============================================================
-# Pydantic (opcional)
+# Pydantic opcional
 # ============================================================
 PYDANTIC_AVAILABLE = False
 try:
@@ -80,45 +88,91 @@ except Exception:
     PYDANTIC_AVAILABLE = False
 
 # ============================================================
-# Prompt de tutor (JSON estricto)
+# Prompt completo y compacto
 # ============================================================
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_FULL = """
 Actúa como un Tutor Psicopedagogo de nivel primario.
-TU OBJETIVO: Intervenir el examen para que el alumno razone, NO para que lo resuelva la IA.
-
-PROCESO (interno):
-1) Resuelve internamente cada consigna para conocer la respuesta correcta.
-2) Diseña una pista 💡 para guiar el razonamiento sin revelar la respuesta.
-3) Adapta por diagnóstico y grupo. Si Grupo A o Discalculia/Dislexia: lenguaje concreto y apoyos visuales.
+OBJETIVO: Intervenir el examen para que el alumno razone. No resuelvas por él.
 
 SALIDA:
 Devuelve EXCLUSIVAMENTE un JSON válido (sin markdown, sin texto extra).
 
 ESQUEMA:
 {
-  "alumno": { "nombre": "string", "grupo": "string", "diagnostico": "string" },
-  "documento": [
-    {
-      "tipo": "consigna",
-      "enunciado_original": "copia fiel literal del examen",
-      "pista": "pista pedagógica (sin dar respuesta)",
-      "visual": { "habilitado": boolean, "prompt": "string opcional" }
-    }
-  ]
+ "alumno": { "nombre": "string", "grupo": "string", "diagnostico": "string" },
+ "documento": [
+  {
+   "tipo": "consigna",
+   "enunciado_original": "copia literal",
+   "pista": "pista pedagógica sin revelar respuesta",
+   "visual": { "habilitado": boolean, "prompt": "string opcional" }
+  }
+ ]
 }
 
 REGLAS:
-- Transcribe el 100% de los enunciados originales (copia fiel).
-- No des respuestas ni soluciones.
+- Copia fiel del 100% de los enunciados del examen (no omitir).
+- No soluciones ni resultados.
+- Pista debe guiar el proceso.
+- Para Grupo A o Dislexia/Discalculia: lenguaje concreto y apoyos simples.
 - Si visual.habilitado=true, visual.prompt debe empezar EXACTAMENTE con:
   "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
-- Usa 🔢, 📖, ✍️ dentro del texto si ayuda a organizar, pero siempre dentro de los strings del JSON.
+- Todo debe estar DENTRO del JSON.
 """.strip()
 
-IMAGE_PROMPT_PREFIX = "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
+def build_prompt_full(nombre: str, diag: str, grupo: str, examen: str) -> str:
+    return f"""{SYSTEM_PROMPT_FULL}
+
+ALUMNO:
+- nombre: {nombre}
+- grupo: {grupo}
+- diagnostico: {diag}
+
+EXAMEN:
+{examen}
+""".strip()
+
+def build_prompt_compact(nombre: str, diag: str, grupo: str, examen: str) -> str:
+    # reduce tokens: pistas muy cortas + visual off
+    return f"""
+Devuelve SOLO JSON válido (sin texto extra).
+Pistas MUY cortas (<=120 caracteres). visual siempre false.
+
+ESQUEMA:
+{{
+ "alumno": {{"nombre":"{nombre}","grupo":"{grupo}","diagnostico":"{diag}"}},
+ "documento":[
+  {{"tipo":"consigna","enunciado_original":"literal","pista":"corta","visual":{{"habilitado":false,"prompt":""}}}}
+ ]
+}}
+
+REGLAS:
+- Copiar literal cada consigna
+- No soluciones
+- No omitir consignas
+- No markdown
+
+EXAMEN:
+{examen}
+""".strip()
+
+def build_repair_prompt(bad: str, why: str) -> str:
+    return f"""
+Devuelve EXCLUSIVAMENTE un JSON válido y corregido (sin texto extra).
+
+Problema detectado:
+{why}
+
+JSON A CORREGIR:
+{bad}
+
+Reglas:
+- Debe cumplir el esquema del sistema
+- No agregues texto fuera del JSON
+""".strip()
 
 # ============================================================
-# Utilidades
+# Utilidades base
 # ============================================================
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -154,7 +208,7 @@ def retry_with_backoff(fn):
                 raise
             sleep = (2 ** i) + random.uniform(0, 0.75)
             time.sleep(min(sleep, 30))
-    raise last  # pragma: no cover
+    raise last
 
 def normalize_bool(v: Any) -> bool:
     if isinstance(v, bool):
@@ -168,10 +222,8 @@ def normalize_bool(v: Any) -> bool:
 def normalize_visual(v: Any) -> Dict[str, Any]:
     if not isinstance(v, dict):
         return {"habilitado": False, "prompt": ""}
-    return {
-        "habilitado": normalize_bool(v.get("habilitado", False)),
-        "prompt": str(v.get("prompt", "")).strip()
-    }
+    return {"habilitado": normalize_bool(v.get("habilitado", False)),
+            "prompt": str(v.get("prompt", "")).strip()}
 
 # ============================================================
 # DOCX extraction (párrafos + tablas, preserva orden)
@@ -197,6 +249,19 @@ def extraer_texto_docx(file) -> str:
             out.append("")
     return "\n".join(out).strip()
 
+def validate_exam_text(exam_text: str) -> Tuple[bool, str, Dict[str, Any]]:
+    info = {
+        "chars": len(exam_text or ""),
+        "lines": (exam_text or "").count("\n") + (1 if exam_text else 0),
+        "pipes": (exam_text or "").count("|"),
+        "preview": (exam_text or "")[:1200],
+    }
+    if not exam_text or not exam_text.strip():
+        return False, "EXAMEN vacío tras extracción (posible texto en imágenes/cuadros).", info
+    if len(exam_text) < 200:
+        return False, "EXAMEN muy corto (<200 chars). Posible doc con imágenes/shapes.", info
+    return True, "OK", info
+
 # ============================================================
 # Model scanning + selection (consultar primero)
 # ============================================================
@@ -216,7 +281,6 @@ def _rank_text_model(name: str) -> Tuple[int, int]:
         if bad in n:
             penalty += 100
 
-    # ranking “potencia” (mejor = menor)
     if "gemini-2.5-pro" in n:
         tier = 0
     elif "gemini-2.5-flash" in n:
@@ -244,9 +308,7 @@ def _rank_text_model(name: str) -> Tuple[int, int]:
     else:
         tier = 30
 
-    # penaliza “exp/preview” si hay alternativas
     exp_penalty = 1 if any(x in n for x in ["exp", "preview", "experimental"]) else 0
-
     return (tier + penalty + exp_penalty, len(n))
 
 def pick_best_text_model(models: List[str]) -> Optional[str]:
@@ -265,21 +327,30 @@ def _candidate_image_models(models: List[str]) -> List[str]:
         nx = x.lower()
         exp = 1 if any(t in nx for t in ["exp", "preview", "experimental"]) else 0
         return (exp, len(nx))
-
     return sorted(cands, key=score)
+
+def _extract_inline_bytes_or_none(resp) -> Optional[bytes]:
+    try:
+        cand = resp.candidates[0]
+        content = getattr(cand, "content", None)
+        if not content or not getattr(content, "parts", None):
+            return None
+        part0 = content.parts[0]
+        inline = getattr(part0, "inline_data", None)
+        data = getattr(inline, "data", None) if inline else None
+        return data
+    except Exception:
+        return None
 
 def smoke_test_image_model(model_id: str) -> Tuple[bool, str]:
     prompt = f"{IMAGE_PROMPT_PREFIX} manzana"
     try:
         m = genai.GenerativeModel(model_id)
         r = retry_with_backoff(lambda: m.generate_content(prompt, safety_settings=SAFETY_SETTINGS))
-        cand = r.candidates[0]
-        part0 = cand.content.parts[0]
-        inline = getattr(part0, "inline_data", None)
-        data = getattr(inline, "data", None) if inline else None
+        data = _extract_inline_bytes_or_none(r)
         if not data:
             return False, "Respuesta sin inline_data.data"
-        if len(data) < 500:
+        if len(data) < SMOKE_IMAGE_MIN_BYTES:
             return False, f"inline_data muy chico ({len(data)} bytes)"
         return True, f"OK bytes={len(data)}"
     except Exception as e:
@@ -289,8 +360,6 @@ def pick_best_image_model(models: List[str]) -> Tuple[Optional[str], str]:
     cands = _candidate_image_models(models)
     if not cands:
         return None, "No se detectaron candidatos de imagen en list_models()."
-
-    # testea hasta 10 para no hacer brute force excesivo
     for mid in cands[:10]:
         ok, msg = smoke_test_image_model(mid)
         if ok:
@@ -329,9 +398,31 @@ def boot_or_stop() -> Dict[str, Any]:
 BOOT = boot_or_stop()
 
 # ============================================================
-# JSON generation + validación + reparación 1 vez
+# Respuesta Gemini: robusto contra finish_reason=2 / sin parts
 # ============================================================
-def validate_json(data: Dict[str, Any]) -> Tuple[bool, str]:
+def _extract_text_or_none(resp) -> Optional[str]:
+    try:
+        cand = resp.candidates[0]
+        content = getattr(cand, "content", None)
+        if not content or not getattr(content, "parts", None):
+            return None
+        chunks = []
+        for p in content.parts:
+            t = getattr(p, "text", None)
+            if t:
+                chunks.append(t)
+        text = "".join(chunks).strip()
+        return text if text else None
+    except Exception:
+        return None
+
+def _finish_reason(resp) -> Optional[int]:
+    try:
+        return int(resp.candidates[0].finish_reason)
+    except Exception:
+        return None
+
+def validate_json_shape(data: Dict[str, Any]) -> Tuple[bool, str]:
     try:
         if PYDANTIC_AVAILABLE:
             AdecuacionModel.model_validate(data)
@@ -344,13 +435,12 @@ def validate_json(data: Dict[str, Any]) -> Tuple[bool, str]:
             return False, "alumno no es objeto"
         if not isinstance(data["documento"], list):
             return False, "documento no es lista"
-
-        # Validación mínima de contenidos
+        if len(data["documento"]) < 1:
+            return False, "documento vacío"
         al = data["alumno"]
         for k in ["nombre", "grupo", "diagnostico"]:
             if k not in al or not isinstance(al[k], str):
                 return False, f"alumno.{k} inválido"
-
         for i, it in enumerate(data["documento"][:200]):
             if not isinstance(it, dict):
                 return False, f"documento[{i}] no es objeto"
@@ -367,86 +457,91 @@ def validate_json(data: Dict[str, Any]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Exception validando: {e}"
 
-def build_prompt(nombre: str, diag: str, grupo: str, examen: str) -> str:
-    return f"{SYSTEM_PROMPT}\n\nALUMNO: {nombre}\nGRUPO: {grupo}\nDIAGNOSTICO: {diag}\n\nEXAMEN:\n{examen}".strip()
+def generate_json_once(model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
+    m = genai.GenerativeModel(model_id)
+    cfg = dict(BASE_GEN_CFG_JSON)
+    cfg["max_output_tokens"] = max_out
+    resp = retry_with_backoff(lambda: m.generate_content(prompt, generation_config=cfg, safety_settings=SAFETY_SETTINGS))
+    text = _extract_text_or_none(resp)
+    if text is None:
+        fr = _finish_reason(resp)
+        raise ValueError(f"Empty candidate (finish_reason={fr})")
+    return json.loads(text)
 
-def build_repair_prompt(bad: str, why: str) -> str:
-    return f"""
-Devuelve EXCLUSIVAMENTE un JSON válido y corregido (sin texto extra).
-
-Problema:
-{why}
-
-JSON A CORREGIR:
-{bad}
-
-Recuerda: debe cumplir el esquema y reglas del sistema. No agregues nada fuera del JSON.
-""".strip()
-
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def cached_generate_json(cache_key: str, model_text: str, prompt: str) -> Dict[str, Any]:
-    m = genai.GenerativeModel(model_text)
-    r = retry_with_backoff(lambda: m.generate_content(
-        prompt,
-        generation_config=GEN_CFG_JSON,
-        safety_settings=SAFETY_SETTINGS
-    ))
-    return json.loads(r.text)
-
-def request_json(nombre: str, diag: str, grupo: str, examen: str, model_text: str, exam_hash: str) -> Dict[str, Any]:
-    prompt = build_prompt(nombre, diag, grupo, examen)
-    cache_key = f"{exam_hash}::{model_text}::{nombre}::{grupo}::{diag}"
-
-    # 1) Cache
+def generate_json_with_repair(model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
+    # intento 1
     try:
-        data = cached_generate_json(cache_key, model_text, prompt)
-        ok, why = validate_json(data)
+        data = generate_json_once(model_id, prompt, max_out)
+        ok, why = validate_json_shape(data)
         if ok:
             return data
         raise ValueError(f"JSON inválido: {why}")
-    except Exception:
-        # 2) Direct + repair once
-        m = genai.GenerativeModel(model_text)
-        r1 = retry_with_backoff(lambda: m.generate_content(
-            prompt,
-            generation_config=GEN_CFG_JSON,
-            safety_settings=SAFETY_SETTINGS
-        ))
-        raw = getattr(r1, "text", "") or ""
-        why = ""
-        try:
-            data1 = json.loads(raw)
-            ok1, why1 = validate_json(data1)
-            if ok1:
-                return data1
-            why = why1
-        except Exception as e:
-            why = f"No parsea JSON: {e}"
+    except Exception as e:
+        # reparación 1 vez
+        m = genai.GenerativeModel(model_id)
+        cfg = dict(BASE_GEN_CFG_JSON)
+        cfg["max_output_tokens"] = max_out
 
+        resp1 = retry_with_backoff(lambda: m.generate_content(prompt, generation_config=cfg, safety_settings=SAFETY_SETTINGS))
+        raw = _extract_text_or_none(resp1)
+        fr = _finish_reason(resp1)
+        if raw is None:
+            raise ValueError(f"Empty candidate (finish_reason={fr})")
+
+        why = f"{type(e).__name__}: {e}"
         repair_prompt = build_repair_prompt(raw, why)
-        r2 = retry_with_backoff(lambda: m.generate_content(
-            repair_prompt,
-            generation_config=GEN_CFG_JSON,
-            safety_settings=SAFETY_SETTINGS
-        ))
-        data2 = json.loads(getattr(r2, "text", "") or "")
-        ok2, why2 = validate_json(data2)
+        resp2 = retry_with_backoff(lambda: m.generate_content(repair_prompt, generation_config=cfg, safety_settings=SAFETY_SETTINGS))
+        raw2 = _extract_text_or_none(resp2)
+        fr2 = _finish_reason(resp2)
+        if raw2 is None:
+            raise ValueError(f"Empty candidate after repair (finish_reason={fr2})")
+        data2 = json.loads(raw2)
+        ok2, why2 = validate_json_shape(data2)
         if not ok2:
             raise ValueError(f"JSON reparado inválido: {why2}")
         return data2
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def cached_generate_json(cache_key: str, model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
+    # cachea el resultado final ya validado
+    data = generate_json_with_repair(model_id, prompt, max_out)
+    return data
+
+def request_json_ultra(model_id: str, prompt_full: str, prompt_compact: str, cache_key: str) -> Tuple[Dict[str, Any], str, int]:
+    """
+    Devuelve (data, mode, max_tokens_used)
+    mode: FULL / COMPACT
+    """
+    # FULL escalado
+    last_err = None
+    for t in OUT_TOKEN_STEPS_FULL:
+        try:
+            data = cached_generate_json(cache_key + f"::FULL::{t}", model_id, prompt_full, t)
+            return data, "FULL", t
+        except Exception as e:
+            last_err = e
+            continue
+
+    # COMPACT fallback
+    for t in OUT_TOKEN_STEPS_COMPACT:
+        try:
+            data = cached_generate_json(cache_key + f"::COMPACT::{t}", model_id, prompt_compact, t)
+            return data, "COMPACT", t
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise last_err if last_err else RuntimeError("Fallo desconocido solicitando JSON")
+
 # ============================================================
-# Imagen (best effort) + validación de bytes
+# Imagen (best effort)
 # ============================================================
 def generar_imagen_ia(model_id: str, prompt_img: str) -> Optional[io.BytesIO]:
     try:
         m = genai.GenerativeModel(model_id)
-        r = retry_with_backoff(lambda: m.generate_content(prompt_img, safety_settings=SAFETY_SETTINGS))
-        cand = r.candidates[0]
-        part0 = cand.content.parts[0]
-        inline = getattr(part0, "inline_data", None)
-        data = getattr(inline, "data", None) if inline else None
-        if not data or len(data) < 500:
+        resp = retry_with_backoff(lambda: m.generate_content(prompt_img, safety_settings=SAFETY_SETTINGS))
+        data = _extract_inline_bytes_or_none(resp)
+        if not data or len(data) < SMOKE_IMAGE_MIN_BYTES:
             return None
         return io.BytesIO(data)
     except Exception:
@@ -457,7 +552,6 @@ def generar_imagen_ia(model_id: str, prompt_img: str) -> Optional[io.BytesIO]:
 # ============================================================
 def renderizar_adecuacion(data_json: Dict[str, Any], logo_bytes: Optional[bytes], activar_img: bool, model_img_id: Optional[str]) -> bytes:
     doc = Document()
-
     style = doc.styles["Normal"]
     style.font.name = "Verdana"
     style.font.size = Pt(11)
@@ -477,7 +571,6 @@ def renderizar_adecuacion(data_json: Dict[str, Any], logo_bytes: Optional[bytes]
     for item in data_json.get("documento", []):
         if not isinstance(item, dict):
             continue
-
         enun = str(item.get("enunciado_original", "")).strip()
         pista = str(item.get("pista", "")).strip()
         visual = normalize_visual(item.get("visual", {}))
@@ -512,11 +605,96 @@ def renderizar_adecuacion(data_json: Dict[str, Any], logo_bytes: Optional[bytes]
     return out.getvalue()
 
 # ============================================================
+# Diagnóstico (DOCX + JSON)
+# ============================================================
+def run_diagnostic(exam_text: str, df_rows: pd.DataFrame, alumno_col: str, grupo_col: str, diag_col: str) -> Dict[str, Any]:
+    ok_exam, msg_exam, info_exam = validate_exam_text(exam_text)
+    out: Dict[str, Any] = {
+        "exam_ok": ok_exam,
+        "exam_msg": msg_exam,
+        "exam_info": info_exam,
+        "json_ok": False,
+        "json_msg": "",
+        "json_preview": "",
+        "json_counts": {},
+        "mode": "",
+        "max_tokens": 0,
+        "model_text": BOOT["text_model"],
+        "model_image": BOOT.get("image_model"),
+    }
+    if not ok_exam:
+        return out
+
+    if len(df_rows) == 0:
+        out["json_ok"] = False
+        out["json_msg"] = "No hay alumnos para probar JSON."
+        return out
+
+    # toma el primer alumno
+    row = df_rows.iloc[0]
+    n = str(row[alumno_col]).strip()
+    g = str(row[grupo_col]).strip()
+    d = str(row[diag_col]).strip()
+
+    prompt_full = build_prompt_full(n, d, g, exam_text)
+    prompt_comp = build_prompt_compact(n, d, g, exam_text)
+    cache_key = f"DIAG::{hash_text(exam_text)}::{BOOT['text_model']}::{n}::{g}::{d}"
+
+    try:
+        data, mode, max_t = request_json_ultra(BOOT["text_model"], prompt_full, prompt_comp, cache_key)
+        okj, whyj = validate_json_shape(data)
+        out["json_ok"] = okj
+        out["json_msg"] = whyj
+        out["mode"] = mode
+        out["max_tokens"] = max_t
+        out["json_counts"] = {
+            "documento_len": len(data.get("documento", [])) if isinstance(data, dict) else 0
+        }
+        # preview seguro
+        out["json_preview"] = json.dumps(data, ensure_ascii=False, indent=2)[:2500]
+        return out
+    except Exception as e:
+        out["json_ok"] = False
+        out["json_msg"] = f"{type(e).__name__}: {e}"
+        return out
+
+# ============================================================
+# BOOT (consultar primero)
+# ============================================================
+@st.cache_resource(show_spinner=False)
+def forced_boot_scan() -> Dict[str, Any]:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    models = list_models_generate_content()
+    if not models:
+        raise RuntimeError("No se detectaron modelos con generateContent. API key inválida/limitada o endpoint incompatible.")
+    text_model = pick_best_text_model(models)
+    if not text_model:
+        raise RuntimeError("No se pudo seleccionar modelo de texto automáticamente.")
+    image_model, image_reason = pick_best_image_model(models)
+    return {
+        "models": models,
+        "text_model": text_model,
+        "image_model": image_model,
+        "image_reason": image_reason,
+        "boot_time": now_str(),
+    }
+
+def boot_or_stop() -> Dict[str, Any]:
+    try:
+        return forced_boot_scan()
+    except Exception as e:
+        st.error("Fallo en arranque (escaneo forzado de modelos). La app no continuará.")
+        st.code(f"{type(e).__name__}: {e}")
+        st.stop()
+
+BOOT = boot_or_stop()
+
+# ============================================================
 # UI + Proceso
 # ============================================================
 def main():
-    st.title("Motor Pedagógico Determinista v14.6")
-    st.caption("Super robusto: escaneo forzado de modelos antes de UI, JSON estricto con reparación, ZIP blindado.")
+    st.title("Motor Pedagógico Determinista v16.0")
+    st.caption("Incluye diagnóstico de parseo (DOCX + JSON) y resiliencia ante MAX_TOKENS.")
 
     # Cargar planilla
     try:
@@ -526,7 +704,7 @@ def main():
         st.error(f"Error cargando planilla: {e}")
         return
 
-    # Column mapping por posición (mantiene tu esquema histórico)
+    # Column mapping por posición (compatibilidad con tu esquema)
     grado_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
     alumno_col = df.columns[2] if len(df.columns) > 2 else df.columns[0]
     grupo_col = df.columns[3] if len(df.columns) > 3 else df.columns[0]
@@ -545,7 +723,7 @@ def main():
 
         st.divider()
         st.header("Selección")
-        grado = st.selectbox("Grado", df[grado_col].dropna().unique())
+        grado = st.selectbox("Grado", sorted(df[grado_col].dropna().unique().tolist()))
         df_f = df[df[grado_col] == grado].copy()
 
         alcance = st.radio("Adecuar para:", ["Todo el grado", "Seleccionar alumnos"], horizontal=True)
@@ -570,20 +748,44 @@ def main():
         logo = st.file_uploader("Logo", type=["png", "jpg", "jpeg"])
         l_bytes = logo.read() if logo else None
 
+        st.divider()
+        st.header("Diagnóstico")
+        diag_mode = st.checkbox("Activar modo diagnóstico", value=True)
         st.caption(f"Pydantic: {'ON' if PYDANTIC_AVAILABLE else 'OFF'}")
 
     archivo = st.file_uploader("Subir Examen Base (DOCX)", type=["docx"])
     if not archivo:
         return
 
-    if st.button("🚀 INICIAR PROCESAMIENTO"):
+    # Extrae examen una sola vez
+    txt_base = extraer_texto_docx(archivo)
+    ok_exam, msg_exam, info_exam = validate_exam_text(txt_base)
+
+    if diag_mode:
+        st.subheader("Diagnóstico de parseo")
+        if ok_exam:
+            st.success(f"Parseo DOCX: OK ({info_exam['chars']} chars, {info_exam['lines']} líneas)")
+        else:
+            st.error(f"Parseo DOCX: {msg_exam}")
+
+        with st.expander("Preview texto extraído (primeros ~1200 chars)", expanded=False):
+            st.text(info_exam.get("preview", ""))
+
+        if st.button("Probar parseo JSON (primer alumno)", disabled=(not ok_exam or len(alumnos_final) == 0)):
+            dres = run_diagnostic(txt_base, alumnos_final, alumno_col, grupo_col, diag_col)
+            if dres["json_ok"]:
+                st.success(f"JSON: OK | mode={dres['mode']} | max_tokens={dres['max_tokens']} | documento={dres['json_counts'].get('documento_len')}")
+            else:
+                st.error(f"JSON: {dres['json_msg']}")
+            with st.expander("Preview JSON (truncado)", expanded=False):
+                st.text(dres.get("json_preview", ""))
+
+    if st.button("🚀 INICIAR PROCESAMIENTO", disabled=(not ok_exam or len(alumnos_final) == 0)):
+        if not ok_exam:
+            st.error(f"No se inicia: {msg_exam}")
+            return
         if len(alumnos_final) == 0:
             st.error("No hay alumnos para procesar (selección vacía).")
-            return
-
-        txt_base = extraer_texto_docx(archivo)
-        if not txt_base.strip():
-            st.error("No se pudo extraer texto del DOCX (vacío).")
             return
 
         exam_hash = hash_text(txt_base)
@@ -595,6 +797,7 @@ def main():
         errors: List[str] = []
         ok_count = 0
 
+        logs.append(f"Motor Pedagógico v16.0")
         logs.append(f"Inicio: {now_str()}")
         logs.append(f"Modelo texto: {model_text}")
         logs.append(f"Modelo imagen: {model_img if model_img else 'N/A'}")
@@ -603,6 +806,7 @@ def main():
         logs.append(f"Total alumnos: {len(alumnos_final)}")
         logs.append(f"Hash examen: {exam_hash}")
         logs.append(f"Pydantic: {'ON' if PYDANTIC_AVAILABLE else 'OFF'}")
+        logs.append(f"DOCX chars: {info_exam.get('chars')} | líneas: {info_exam.get('lines')} | pipes: {info_exam.get('pipes')}")
         logs.append("")
 
         with zipfile.ZipFile(zip_io, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -620,10 +824,23 @@ def main():
                 status.info(f"Procesando: {n} ({i}/{total})")
 
                 try:
-                    data = request_json(n, d, g, txt_base, model_text, exam_hash)
-                    docx_bytes = renderizar_adecuacion(data, l_bytes, activar_img=bool(model_img), model_img_id=model_img)
+                    prompt_full = build_prompt_full(n, d, g, txt_base)
+                    prompt_comp = build_prompt_compact(n, d, g, txt_base)
+                    cache_key = f"{exam_hash}::{model_text}::{n}::{g}::{d}"
+
+                    data, mode, max_t = request_json_ultra(model_text, prompt_full, prompt_comp, cache_key)
+
+                    docx_bytes = renderizar_adecuacion(
+                        data_json=data,
+                        logo_bytes=l_bytes,
+                        activar_img=bool(model_img),
+                        model_img_id=model_img
+                    )
                     zf.writestr(f"Adecuacion_{safe_filename(n)}.docx", docx_bytes)
                     ok_count += 1
+
+                    zf.writestr(f"_META_{safe_filename(n)}.txt", f"mode={mode}\nmax_tokens={max_t}\n")
+
                 except Exception as e:
                     msg = f"{n} :: {type(e).__name__} :: {e}"
                     errors.append(msg)
@@ -646,7 +863,7 @@ def main():
             zf.writestr("_RESUMEN.txt", "\n".join(resumen))
 
         st.success(f"Lote finalizado. OK: {ok_count} | Errores: {len(errors)}")
-        st.download_button("📥 Descargar Adecuaciones (ZIP)", zip_io.getvalue(), f"adecuaciones_v14_6.zip", mime="application/zip")
+        st.download_button("📥 Descargar Adecuaciones (ZIP)", zip_io.getvalue(), "adecuaciones_v16_0.zip", mime="application/zip")
 
 if __name__ == "__main__":
     main()
