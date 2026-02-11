@@ -20,19 +20,17 @@ from docx.oxml import OxmlElement
 
 
 # ============================================================
-# Nano Opal v22.0
-# Objetivo:
-# - Mantener selector por GRADO (planilla con dificultades por alumno)
-# - Robustez JSON (no depender de response.text) + reparación 1 vez
-# - Estética "Opal Card" en DOCX (sin itálicas, Verdana 14, line spacing 1.5-1.8)
-# - Imágenes: soportar gemini-2.5-flash-image aunque NO devuelva inline_data por default.
-#   => Forzamos responseModalities/Image en generation_config + parsers múltiples:
-#      inline_data / inlineData / data URI base64 / texto base64
-# - Boot: consultar primero, ejecutar después, y desactivar imagen si smoke test falla
-# - ZIP siempre con _REPORTE.txt y _RESUMEN.txt + ERROR_{alumno}.txt
+# Nano Opal v23.0 (Fix definitivo del 404 texto + fail-fast)
+# Cambios críticos:
+# 1) BOOT REAL: ListModels en tu cuenta, elige un modelo que SOPORTE generateContent.
+#    NO usa strings hardcodeadas salvo como preferencias.
+# 2) SMOKE TEST TEXTO: antes de procesar, prueba generateContent y falla en segundos.
+# 3) Fail-fast por alumno: si el modelo texto cae, intenta fallback a otro modelo visible.
+# 4) Imágenes: smoke test y parsers robustos (igual que v22).
+# 5) Mantiene selector por GRADO y columnas desde Sheets.
 # ============================================================
 
-st.set_page_config(page_title="Nano Opal v22.0 🍌", layout="wide", page_icon="🍌")
+st.set_page_config(page_title="Nano Opal v23.0 🍌", layout="wide", page_icon="🍌")
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
@@ -40,9 +38,8 @@ URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format
 RETRIES = 6
 CACHE_TTL_SECONDS = 6 * 60 * 60
 
-# Visual prompt requerido por tu consigna
 IMAGE_PROMPT_PREFIX = "Pictograma estilo ARASAAC, trazos negros gruesos, fondo blanco, ultra simple, sin sombras de: "
-MIN_IMAGE_BYTES = 1200  # umbral realista para PNG 1024
+MIN_IMAGE_BYTES = 1200
 
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -193,18 +190,17 @@ def validate_text_input(text: str, mode: str) -> Tuple[bool, str, Dict[str, Any]
     }
     if mode == "ADAPTAR":
         if not text or not text.strip():
-            return False, "TEXTO vacío tras extracción (posible actividad en imágenes/shapes).", info
+            return False, "TEXTO vacío tras extracción.", info
         if len(text) < 120:
             return False, "TEXTO muy corto (<120 chars).", info
         return True, "OK", info
-    # CREAR
     if not text or not text.strip():
         return False, "Brief vacío.", info
     return True, "OK", info
 
 
 # ============================================================
-# DOCX extraction (párrafos + tablas)
+# DOCX extraction
 # ============================================================
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
@@ -229,7 +225,7 @@ def extraer_texto_docx(file) -> str:
 
 
 # ============================================================
-# Robust response parsing (TEXT)
+# Response parsing (TEXT)
 # ============================================================
 def _extract_text_or_none(resp) -> Optional[str]:
     try:
@@ -255,7 +251,7 @@ def _finish_reason(resp) -> Optional[int]:
 
 
 # ============================================================
-# Robust image parsing (INLINE / inlineData / data URI / base64 text)
+# Image parsing
 # ============================================================
 DATA_URI_RE = re.compile(r"data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\n\r]+)")
 
@@ -266,7 +262,6 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
         return bytes(x)
     if isinstance(x, str):
         s = x.strip()
-        # data uri
         m = DATA_URI_RE.search(s)
         if m:
             b64 = m.group(2)
@@ -274,7 +269,6 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
                 return base64.b64decode(b64, validate=False)
             except Exception:
                 return None
-        # plain base64 (heurística)
         if len(s) > 400 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in s[:200]):
             try:
                 return base64.b64decode(s, validate=False)
@@ -283,41 +277,28 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
     return None
 
 def _extract_inline_bytes_or_none(resp) -> Optional[bytes]:
-    """
-    Intenta extraer imagen desde:
-    - part.inline_data.data (SDK viejo)
-    - part.inlineData.data (SDK/format alternativo)
-    - part.text con data URI o base64
-    """
     try:
         cand = resp.candidates[0]
         content = getattr(cand, "content", None)
         if not content or not getattr(content, "parts", None):
             return None
-
         for part in content.parts:
-            # 1) inline_data (python google.generativeai viejo)
             inline = getattr(part, "inline_data", None)
             if inline is not None:
                 data = getattr(inline, "data", None)
                 b = _maybe_b64_to_bytes(data) or (data if isinstance(data, (bytes, bytearray)) else None)
                 if b:
                     return b
-
-            # 2) inlineData (otros bindings)
             inline2 = getattr(part, "inlineData", None)
             if inline2 is not None:
                 data2 = getattr(inline2, "data", None)
                 b2 = _maybe_b64_to_bytes(data2)
                 if b2:
                     return b2
-
-            # 3) texto con data uri / base64
             t = getattr(part, "text", None)
             b3 = _maybe_b64_to_bytes(t)
             if b3:
                 return b3
-
         return None
     except Exception:
         return None
@@ -325,26 +306,17 @@ def _extract_inline_bytes_or_none(resp) -> Optional[bytes]:
 def _looks_like_image(b: bytes) -> bool:
     if not b or len(b) < MIN_IMAGE_BYTES:
         return False
-    # PNG
     if b[:8] == b"\x89PNG\r\n\x1a\n":
         return True
-    # JPEG
     if b[:3] == b"\xff\xd8\xff":
         return True
-    # WEBP (RIFF....WEBP)
     if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
         return True
     return False
 
 def generate_image_bytes(model_id: str, prompt_img: str) -> Optional[bytes]:
-    """
-    Para gemini-2.5-flash-image es CRÍTICO forzar response modalities.
-    En REST/documentación se usa generationConfig.responseModalities=["Image"].
-    El SDK viejo puede ignorarlo, pero lo intentamos en variantes.
-    """
     if not model_id:
         return None
-
     prompt_img = normalize_visual_prompt(prompt_img)
 
     def call_with_cfg(cfg: Optional[Dict[str, Any]]):
@@ -353,68 +325,164 @@ def generate_image_bytes(model_id: str, prompt_img: str) -> Optional[bytes]:
             return m.generate_content(prompt_img, safety_settings=SAFETY_SETTINGS)
         return m.generate_content(prompt_img, generation_config=cfg, safety_settings=SAFETY_SETTINGS)
 
-    # Variantes de config para maximizar compatibilidad con SDK viejo
     cfg_variants = [
         {"response_modalities": ["Image"]},
         {"response_modalities": ["IMAGE"]},
-        {"responseModalities": ["Image"]},   # por si el binding respeta camelCase
+        {"responseModalities": ["Image"]},
         {"responseModalities": ["IMAGE"]},
-        None,  # último recurso
+        None,
     ]
 
-    last = None
     for cfg in cfg_variants:
         try:
             resp = retry_with_backoff(lambda: call_with_cfg(cfg))
             b = _extract_inline_bytes_or_none(resp)
             if b and _looks_like_image(b):
                 return b
-        except Exception as e:
-            last = e
+        except Exception:
             continue
     return None
 
 
 # ============================================================
-# Boot Scan (mantiene preferidos y smoke test real)
+# Boot REAL: listar modelos + smoke test texto + seleccionar
 # ============================================================
+def list_models_generate_content() -> List[str]:
+    models = []
+    for m in genai.list_models():
+        try:
+            if 'generateContent' in getattr(m, "supported_generation_methods", []):
+                models.append(m.name)
+        except Exception:
+            continue
+    return models
+
+def rank_text_models(models: List[str], prefer: str) -> List[str]:
+    # prefer puede ser "gemini-1.5-flash" pero en tu cuenta quizá es "models/gemini-2.0-flash-001"
+    prefer = (prefer or "").strip()
+    prios = []
+    if prefer:
+        prios.append(prefer)
+        # si el usuario escribió sin "models/"
+        if not prefer.startswith("models/"):
+            prios.append("models/" + prefer)
+    # ranking general por potencia/latencia
+    # (lo importante: elegir uno EXISTENTE y con generateContent)
+    prios += [
+        "models/gemini-2.5-pro",
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash",
+        "models/gemini-2.0-flash-001",
+        "models/gemini-1.5-pro",
+        "models/gemini-1.5-flash",
+        "models/gemini-pro",
+    ]
+    # first match by substring containment OR exact
+    ordered = []
+    used = set()
+    for p in prios:
+        for real in models:
+            if real in used:
+                continue
+            if real == p or p in real or (p.startswith("models/") and p.replace("models/", "") in real):
+                ordered.append(real)
+                used.add(real)
+    # add remaining
+    for real in models:
+        if real not in used:
+            ordered.append(real)
+            used.add(real)
+    return ordered
+
+def smoke_test_text_model(model_id: str) -> Tuple[bool, str]:
+    try:
+        m = genai.GenerativeModel(model_id)
+        cfg = {"temperature": 0, "max_output_tokens": 64}
+        resp = retry_with_backoff(lambda: m.generate_content("Responde SOLO: OK", generation_config=cfg, safety_settings=SAFETY_SETTINGS))
+        t = _extract_text_or_none(resp)
+        if not t:
+            fr = _finish_reason(resp)
+            return False, f"Sin texto (finish_reason={fr})"
+        if "ok" not in t.lower():
+            return True, f"Texto recibido (no 'OK'): {t[:30]}"
+        return True, "OK"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 def smoke_test_image_model(model_id: str) -> Tuple[bool, str]:
     try:
         b = generate_image_bytes(model_id, IMAGE_PROMPT_PREFIX + "manzana")
         if not b:
-            return False, "No se obtuvo imagen válida (sin bytes o formato no reconocido)"
+            return False, "No se obtuvo imagen válida"
         return True, f"OK bytes={len(b)}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
 def boot_pick_models(prefer_text: str, prefer_image: str) -> Dict[str, Any]:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    visible = list_models_generate_content()
 
-    txt = prefer_text.strip() if prefer_text else None
+    if not visible:
+        return {"txt": None, "img": None, "txt_reason": "No hay modelos con generateContent visibles", "img_reason": "", "visible": [], "boot_time": now_str()}
 
+    # TEXT: probar candidatos hasta que uno pase
+    txt = None
+    txt_reason = ""
+    for cand in rank_text_models(visible, prefer_text):
+        ok, msg = smoke_test_text_model(cand)
+        if ok:
+            txt = cand
+            txt_reason = f"OK: {msg}"
+            break
+        else:
+            txt_reason = f"FAIL {cand}: {msg}"
+            # seguir probando
+
+    # IMAGE: si el usuario quiere, probar preferido, sino desactivar
     img = None
     img_reason = ""
     if prefer_image and prefer_image.strip():
-        ok, msg = smoke_test_image_model(prefer_image.strip())
-        if ok:
-            img = prefer_image.strip()
-            img_reason = f"Preferido OK: {msg}"
-        else:
-            img = None
-            img_reason = f"Preferido FAIL: {msg}"
+        # permitir input sin models/
+        img_cands = [prefer_image.strip()]
+        if not prefer_image.strip().startswith("models/"):
+            img_cands.append("models/" + prefer_image.strip())
 
-    return {"txt": txt, "img": img, "img_reason": img_reason, "boot_time": now_str()}
+        # también, si el listado tiene alguno con "image" o "imagen", sumar
+        for m in visible:
+            if ("image" in m.lower()) or ("imagen" in m.lower()):
+                img_cands.append(m)
+
+        seen = set()
+        img_cands = [x for x in img_cands if not (x in seen or seen.add(x))]
+
+        for ic in img_cands:
+            ok, msg = smoke_test_image_model(ic)
+            if ok:
+                img = ic
+                img_reason = f"OK: {msg}"
+                break
+            else:
+                img_reason = f"FAIL {ic}: {msg}"
+
+    return {
+        "txt": txt,
+        "img": img,
+        "txt_reason": txt_reason,
+        "img_reason": img_reason if img_reason else ("Desactivado" if not prefer_image else img_reason),
+        "visible": visible[:200],
+        "boot_time": now_str(),
+    }
 
 @st.cache_resource(show_spinner=False)
 def boot_cached(prefer_text: str, prefer_image: str) -> Dict[str, Any]:
     try:
         return boot_pick_models(prefer_text, prefer_image)
     except Exception as e:
-        return {"txt": None, "img": None, "img_reason": f"Boot error: {e}", "boot_time": now_str()}
+        return {"txt": None, "img": None, "txt_reason": f"Boot error: {e}", "img_reason": "", "visible": [], "boot_time": now_str()}
 
 
 # ============================================================
-# JSON generation + validación + repair
+# JSON generation
 # ============================================================
 def validate_activity_json(data: Dict[str, Any]) -> Tuple[bool, str]:
     try:
@@ -499,7 +567,6 @@ def generate_json_with_repair(model_id: str, prompt: str, max_out: int) -> Dict[
             return data
         raise ValueError(f"JSON inválido: {why}")
     except Exception as e:
-        # capturamos la 1ra salida cruda y pedimos repair
         m = genai.GenerativeModel(model_id)
         cfg = dict(BASE_GEN_CFG_JSON)
         cfg["max_output_tokens"] = max_out
@@ -549,15 +616,11 @@ def request_activity_ultra(model_id: str, prompt_full: str, prompt_compact: str,
 # ============================================================
 def apply_card_style(cell):
     tc_pr = cell._tc.get_or_add_tcPr()
-
-    # sombreado
     shd = OxmlElement('w:shd')
     shd.set(qn('w:val'), 'clear')
     shd.set(qn('w:color'), 'auto')
     shd.set(qn('w:fill'), "FAFAFA")
     tc_pr.append(shd)
-
-    # bordes
     tc_borders = OxmlElement('w:tcBorders')
     for b in ['top', 'left', 'bottom', 'right']:
         edge = OxmlElement(f'w:{b}')
@@ -578,7 +641,7 @@ def add_runs_with_bold_markers(paragraph, text: str, font_name: str = "Verdana",
     for i, part in enumerate(parts):
         run = paragraph.add_run(part)
         run.bold = (not bold_default) if (i % 2 == 1) else bold_default
-        run.italic = False  # prohibido itálicas
+        run.italic = False
         run.font.name = font_name
         run.font.size = Pt(font_size_pt)
 
@@ -601,7 +664,6 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
     style.font.name = 'Verdana'
     style.font.size = Pt(14)
 
-    # header
     header = doc.add_table(rows=1, cols=2)
     header.width = Inches(6.5)
     if logo_b:
@@ -620,31 +682,27 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
 
     doc.add_paragraph("")
 
-    # Objetivo
     p_t = doc.add_paragraph()
     rt = p_t.add_run("Objetivo de aprendizaje")
     rt.bold = True
     rt.italic = False
     rt.font.size = Pt(14)
-
     p = doc.add_paragraph()
     p.paragraph_format.line_spacing = 1.6
     add_runs_with_bold_markers(p, data.get("objetivo_aprendizaje", ""))
 
-    # Consigna
     p_t = doc.add_paragraph()
     rt = p_t.add_run("Consigna adaptada")
     rt.bold = True
     rt.italic = False
     rt.font.size = Pt(14)
-
     p = doc.add_paragraph()
     p.paragraph_format.line_spacing = 1.6
     add_runs_with_bold_markers(p, data.get("consigna_adaptada", ""))
 
     doc.add_paragraph("")
 
-    # Imagen global (1 por ficha, no por item)
+    # imagen global (1 por ficha)
     img_bytes = None
     visual = data.get("visual", {}) if isinstance(data.get("visual", {}), dict) else {}
     if enable_img and img_model_id and normalize_bool(visual.get("habilitado", False)):
@@ -661,7 +719,6 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
             pass
         doc.add_paragraph("")
 
-    # Cards
     for it in data.get("items", []):
         if not isinstance(it, dict):
             continue
@@ -680,12 +737,10 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
         apply_card_style(cell)
         clear_paragraph(cell.paragraphs[0])
 
-        # Enunciado
         pe = cell.add_paragraph()
         pe.paragraph_format.line_spacing = 1.8
         add_runs_with_bold_markers(pe, enunciado, bold_default=True)
 
-        # Opciones / respuesta
         if opciones:
             for opt in opciones[:10]:
                 po = cell.add_paragraph()
@@ -699,7 +754,6 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
             pr = cell.add_paragraph()
             add_response_line(pr)
 
-        # Pista verde (sin itálica)
         if pista:
             pp = cell.add_paragraph()
             pp.paragraph_format.line_spacing = 1.6
@@ -712,24 +766,20 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
 
         doc.add_paragraph("")
 
-    # Adecuaciones
     p_t = doc.add_paragraph()
     rt = p_t.add_run("Adecuaciones aplicadas")
     rt.bold = True
     rt.italic = False
     rt.font.size = Pt(14)
-
     for a in (data.get("adecuaciones_aplicadas", []) or [])[:30]:
         pa = doc.add_paragraph(f"• {a}")
         pa.paragraph_format.line_spacing = 1.6
 
-    # Sugerencias
     p_t = doc.add_paragraph()
     rt = p_t.add_run("Sugerencias para el docente")
     rt.bold = True
     rt.italic = False
     rt.font.size = Pt(14)
-
     for s in (data.get("sugerencias_docente", []) or [])[:30]:
         ps = doc.add_paragraph(f"• {s}")
         ps.paragraph_format.line_spacing = 1.6
@@ -740,13 +790,13 @@ def render_opal_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Optio
 
 
 # ============================================================
-# UI + Proceso por GRADO (se mantiene)
+# MAIN
 # ============================================================
 def main():
-    st.title("Nano Opal v22.0 🧠🍌")
-    st.caption("Opal-card DOCX + JSON determinista + imágenes robustas para gemini-2.5-flash-image")
+    st.title("Nano Opal v23.0 🧠🍌")
+    st.caption("Elimina 404 de modelos: boot real con ListModels + smoke test texto en segundos.")
 
-    # Planilla
+    # Load sheet
     try:
         df = pd.read_csv(URL_PLANILLA)
         df.columns = [c.strip() for c in df.columns]
@@ -754,41 +804,55 @@ def main():
         st.error(f"Error cargando planilla: {e}")
         return
 
-    # Mapeo columnas (mismo patrón que venías usando)
+    # Columns mapping (mantener grado)
     grado_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
     alumno_col = df.columns[2] if len(df.columns) > 2 else df.columns[0]
     grupo_col = df.columns[3] if len(df.columns) > 3 else df.columns[0]
     diag_col = df.columns[4] if len(df.columns) > 4 else df.columns[0]
 
-    # Sidebar
     with st.sidebar:
-        st.header("⚙️ Configuración")
+        st.header("⚙️ Boot / Modelos")
 
         prefer_txt = st.text_input("Modelo texto (preferido)", value="gemini-1.5-flash")
         prefer_img = st.text_input("Modelo imagen (preferido)", value="gemini-2.5-flash-image")
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("Reboot (rescan)"):
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Reboot (ListModels)"):
                 st.cache_resource.clear()
-        with col_b:
+        with col2:
             if st.button("Limpiar cache"):
                 st.cache_data.clear()
+
+        try:
+            genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+        except Exception as e:
+            st.error(f"API Key inválida o faltante: {e}")
+            return
 
         CONFIG = boot_cached(prefer_txt, prefer_img)
 
         st.write(f"Boot: {CONFIG.get('boot_time')}")
-        st.success(f"Texto: {CONFIG.get('txt')}" if CONFIG.get("txt") else "Texto: N/A")
-        if CONFIG.get("img"):
-            st.success(f"Imagen: {CONFIG.get('img')}")
+        if CONFIG.get("txt"):
+            st.success(f"Texto seleccionado: {CONFIG.get('txt')}")
+            st.caption(f"Texto reason: {CONFIG.get('txt_reason','')}")
         else:
-            st.warning("Imagen: N/A (desactivado)")
-        st.caption(CONFIG.get("img_reason", ""))
+            st.error("No se pudo seleccionar un modelo de texto válido.")
+            st.caption(CONFIG.get("txt_reason",""))
+        if CONFIG.get("img"):
+            st.success(f"Imagen seleccionada: {CONFIG.get('img')}")
+            st.caption(f"Imagen reason: {CONFIG.get('img_reason','')}")
+        else:
+            st.warning("Imagen: desactivada")
+            st.caption(CONFIG.get("img_reason",""))
+
+        with st.expander("Modelos visibles (generateContent)", expanded=False):
+            for m in (CONFIG.get("visible", []) or []):
+                st.write(m)
 
         st.divider()
 
-        # Mantener selector por GRADO
-        st.subheader("Grupo / Planilla")
+        st.header("📚 Grado / Alumnos (Sheets)")
         grado = st.selectbox("Grado", sorted(df[grado_col].dropna().unique().tolist()))
         df_f = df[df[grado_col] == grado].copy()
 
@@ -807,10 +871,10 @@ def main():
         l_bytes = logo.read() if logo else None
 
         st.divider()
-        inst_style = st.text_area("Instrucciones de Estilo On-the-fly", height=120, placeholder="Ej: 2 ejemplos guiados, 6 ítems, 2 multiple choice, 2 completar, usar objetos concretos.")
+        inst_style = st.text_area("Instrucciones de Estilo On-the-fly", height=120)
 
     if not CONFIG.get("txt"):
-        st.error("Falta modelo de texto o API Key.")
+        st.error("Sin modelo de texto funcional (boot falló).")
         return
 
     tab1, tab2 = st.tabs(["🔄 Adaptar DOCX", "✨ Crear Actividad"])
@@ -857,7 +921,7 @@ def main():
 
     if st.button("🚀 GENERAR LOTE"):
         if len(df_final) == 0:
-            st.error("No hay alumnos (ver selección por grado / alumnos).")
+            st.error("No hay alumnos (seleccioná por grado/alumnos).")
             return
 
         if mode == "ADAPTAR" and not adapt_docx:
@@ -869,12 +933,18 @@ def main():
             st.error(f"No se inicia: {msg_in}")
             return
 
+        # FAIL-FAST extra: re-smoke test del texto justo antes de correr
+        ok_smoke, msg_smoke = smoke_test_text_model(CONFIG["txt"])
+        if not ok_smoke:
+            st.error(f"Modelo texto seleccionado no responde: {msg_smoke}")
+            return
+
         zip_io = io.BytesIO()
         logs = []
         errors = []
         ok_count = 0
 
-        logs.append("Nano Opal v22.0")
+        logs.append("Nano Opal v23.0")
         logs.append(f"Inicio: {now_str()}")
         logs.append(f"Modo: {mode}")
         logs.append(f"Modelo texto: {CONFIG.get('txt')}")
@@ -882,6 +952,7 @@ def main():
         logs.append(f"Imagen habilitada: {enable_img}")
         logs.append(f"Grado (planilla): {grado}")
         logs.append(f"Alumnos: {len(df_final)}")
+        logs.append(f"TXT smoke: {msg_smoke}")
         logs.append("")
 
         with zipfile.ZipFile(zip_io, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -918,12 +989,6 @@ ALUMNO (planilla):
 - diagnostico: {d}
 - grupo: {g}
 - grado: {grado}
-
-RECORDATORIOS:
-- items[].enunciado inicia con emoji (✍️📖🔢🎨)
-- pista_visual = micro-pasos concretos
-- sin itálicas
-- visual.prompt inicia con "{IMAGE_PROMPT_PREFIX}" si visual.habilitado=true
 """
 
                     prompt_compact = f"""Devuelve SOLO JSON válido.
@@ -940,9 +1005,32 @@ ALUMNO: {n} | {d} | Grupo {g} | Grado {grado}
 """
 
                     cache_key = f"{base_hash}::{safe_filename(n)}::{safe_filename(g)}::{safe_filename(d)}"
-                    data, mode_used, max_t = request_activity_ultra(CONFIG.get("txt"), prompt_full, prompt_compact, cache_key)
 
-                    # Normalización defensiva
+                    # Si el modelo texto "muere" a mitad, probamos fallback a otro visible
+                    try:
+                        data, mode_used, max_t = request_activity_ultra(CONFIG["txt"], prompt_full, prompt_compact, cache_key)
+                        used_model = CONFIG["txt"]
+                    except Exception as e0:
+                        # fallback: intentar 2 modelos más del listado visible
+                        fallback_models = [m for m in (CONFIG.get("visible", []) or []) if m != CONFIG["txt"]][:2]
+                        got = False
+                        last = e0
+                        for fm in fallback_models:
+                            okf, _ = smoke_test_text_model(fm)
+                            if not okf:
+                                continue
+                            try:
+                                data, mode_used, max_t = request_activity_ultra(fm, prompt_full, prompt_compact, cache_key + f"::FB::{fm}")
+                                used_model = fm
+                                got = True
+                                break
+                            except Exception as e1:
+                                last = e1
+                                continue
+                        if not got:
+                            raise last
+
+                    # Normalización
                     items_norm = []
                     for it in (data.get("items", []) or []):
                         if not isinstance(it, dict):
@@ -961,13 +1049,11 @@ ALUMNO: {n} | {d} | Grupo {g} | Grado {grado}
                         })
                     data["items"] = items_norm
 
-                    # Visual
                     v = data.get("visual", {}) if isinstance(data.get("visual", {}), dict) else {}
                     v_en = normalize_bool(v.get("habilitado", False))
                     v_pr = normalize_visual_prompt(str(v.get("prompt", "")).strip()) if v_en else ""
                     data["visual"] = {"habilitado": v_en, "prompt": v_pr}
 
-                    # Control calidad
                     data.setdefault("control_calidad", {})
                     if isinstance(data["control_calidad"], dict):
                         data["control_calidad"]["items_count"] = len(data["items"])
@@ -980,7 +1066,7 @@ ALUMNO: {n} | {d} | Grupo {g} | Grado {grado}
                     docx_bytes = render_opal_docx(data, alumno, l_bytes, CONFIG.get("img"), enable_img=enable_img)
 
                     zf.writestr(f"Ficha_{safe_filename(n)}.docx", docx_bytes)
-                    zf.writestr(f"_META_{safe_filename(n)}.txt", f"mode={mode_used}\nmax_tokens={max_t}\nitems={len(data.get('items',[]))}\n")
+                    zf.writestr(f"_META_{safe_filename(n)}.txt", f"used_model={used_model}\nmode={mode_used}\nmax_tokens={max_t}\nitems={len(data.get('items',[]))}\n")
                     ok_count += 1
 
                 except Exception as e:
@@ -1004,7 +1090,7 @@ ALUMNO: {n} | {d} | Grupo {g} | Grado {grado}
             zf.writestr("_RESUMEN.txt", "\n".join(resumen))
 
         st.success(f"Lote finalizado. OK: {ok_count} | Errores: {len(errors)}")
-        st.download_button("📥 Descargar ZIP", zip_io.getvalue(), "nano_opal_v22_0.zip", mime="application/zip")
+        st.download_button("📥 Descargar ZIP", zip_io.getvalue(), "nano_opal_v23_0.zip", mime="application/zip")
 
 
 if __name__ == "__main__":
