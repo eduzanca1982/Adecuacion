@@ -15,19 +15,20 @@ from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # ============================================================
-# Motor Pedagógico v16.0 (Super Robusto + Diagnóstico de Parseo)
-# - Consultar primero, ejecutar después: escaneo forzado de modelos en boot
-# - Selección automática del mejor modelo de texto disponible
-# - Selección automática de modelo de imagen (si existe) por smoke test
-# - Manejo robusto de finish_reason=2 (MAX_TOKENS) y respuestas sin parts
-# - JSON estricto + reparación 1 vez + validación dura
-# - Fallback compacto automático si el JSON no entra
-# - Diagnóstico UI: Probar parseo (DOCX + JSON) antes de procesar lote
-# - ZIP blindado: siempre incluye _REPORTE.txt y _RESUMEN.txt + archivos ERROR_*.txt
-# - Render inclusivo (Verdana + interlineado) + pistas verdes
+# Motor Pedagógico v17.0 (Opal++ Ultra)
+# SUPERIOR a la versión de Gemini en:
+# - Dos modos de entrada: (A) DOCX a adaptar (B) Prompt para generar desde cero
+# - Diagnóstico de parseo (DOCX + JSON) antes del lote
+# - Selección automática robusta de modelos (texto + imagen) con ranking y smoke test
+# - Manejo de finish_reason=2 (MAX_TOKENS) y respuestas sin parts
+# - JSON estricto + validación dura + reparación 1 vez + fallback compacto
+# - Detección/normalización de visual.prompt + validación de bytes de imagen
+# - Render DOCX “dyslexia-friendly” (Verdana 14 + interlineado + bloques cortos)
+# - ZIP blindado: _REPORTE.txt, _RESUMEN.txt, ERROR_*.txt, _META_*.txt
+# - Cache por examen/brief/alumno para ahorrar tokens y estabilizar resultados
 # ============================================================
 
-st.set_page_config(page_title="Motor Pedagógico v16.0", layout="wide")
+st.set_page_config(page_title="Motor Pedagógico v17.0 (Opal++)", layout="wide")
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
@@ -45,7 +46,6 @@ SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
-# JSON: minimiza desvíos
 BASE_GEN_CFG_JSON = {
     "response_mime_type": "application/json",
     "temperature": 0,
@@ -53,12 +53,12 @@ BASE_GEN_CFG_JSON = {
     "top_k": 1,
 }
 
-# escalado de output tokens para evitar finish_reason=2
+# Escalado tokens: FULL primero, luego COMPACT
 OUT_TOKEN_STEPS_FULL = [4096, 6144, 8192]
 OUT_TOKEN_STEPS_COMPACT = [2048, 4096]
 
 # ============================================================
-# Pydantic opcional
+# Pydantic opcional (si está instalado)
 # ============================================================
 PYDANTIC_AVAILABLE = False
 try:
@@ -70,90 +70,180 @@ try:
 
     class ItemModel(BaseModel):
         tipo: str = Field(...)
-        enunciado_original: str = Field(...)
-        pista: str = Field(...)
-        visual: VisualModel = Field(...)
+        enunciado: str = Field(...)
+        opciones: List[str] = Field(default_factory=list)
 
     class AlumnoModel(BaseModel):
         nombre: str = Field(...)
         grupo: str = Field(...)
         diagnostico: str = Field(...)
+        grado: str = Field(...)
 
-    class AdecuacionModel(BaseModel):
+    class ActividadModel(BaseModel):
         alumno: AlumnoModel = Field(...)
-        documento: List[ItemModel] = Field(...)
+        contexto: Dict[str, Any] = Field(...)
+        objetivo_aprendizaje: str = Field(...)
+        consigna_adaptada: str = Field(...)
+        items: List[ItemModel] = Field(...)
+        adecuaciones_aplicadas: List[str] = Field(default_factory=list)
+        sugerencias_docente: List[str] = Field(default_factory=list)
+        visual: VisualModel = Field(...)
+        control_calidad: Dict[str, Any] = Field(...)
 
     PYDANTIC_AVAILABLE = True
 except Exception:
     PYDANTIC_AVAILABLE = False
 
 # ============================================================
-# Prompt completo y compacto
+# Prompt Opal++ (salida JSON determinista)
+# - Soporta "ADAPTAR" (con actividad base) o "CREAR" (solo brief)
+# - Incluye control_calidad: conteos y garantías para auditar
 # ============================================================
-SYSTEM_PROMPT_FULL = """
-Actúa como un Tutor Psicopedagogo de nivel primario.
-OBJETIVO: Intervenir el examen para que el alumno razone. No resuelvas por él.
+SYSTEM_PROMPT_OPALPP = f"""
+Actúa como un Asistente Pedagógico Experto en Inclusión y Dislexia.
+
+TU OBJETIVO:
+- Si MODO=ADAPTAR: transformar una actividad original en una versión accesible e inclusiva.
+- Si MODO=CREAR: crear una actividad inclusiva desde cero en base a un brief.
+
+GUÍAS ESTRICTAS (Dyslexia-friendly):
+- Tipografía recomendada: Sans Serif (Arial, Verdana, Open Sans). (El DOCX usará Verdana 14)
+- Tamaño 14, interlineado 1.5 a 2.0
+- Texto oscuro sobre fondo claro
+- Bloques cortos (1 idea por bloque), listas numeradas/viñetas
+- **Negrita** solo para palabras clave; evitar itálicas/subrayado (en la salida textual)
+- Consignas claras: 1 acción por frase, pasos secuenciales
+- Vocabulario concreto; evitar metáforas/ambigüedades
+- Siempre dar un ejemplo breve cuando sea útil
+- Reducir ítems para evitar fatiga cognitiva (prioriza comprensión)
+- No penalizar ortografía si el objetivo no es ortografía
+- Sugerir tiempo extra y lectura acompañada
 
 SALIDA:
 Devuelve EXCLUSIVAMENTE un JSON válido (sin markdown, sin texto extra).
 
-ESQUEMA:
-{
- "alumno": { "nombre": "string", "grupo": "string", "diagnostico": "string" },
- "documento": [
-  {
-   "tipo": "consigna",
-   "enunciado_original": "copia literal",
-   "pista": "pista pedagógica sin revelar respuesta",
-   "visual": { "habilitado": boolean, "prompt": "string opcional" }
-  }
- ]
-}
+ESQUEMA EXACTO:
+{{
+  "alumno": {{
+    "nombre": "string",
+    "grupo": "string",
+    "diagnostico": "string",
+    "grado": "string"
+  }},
+  "contexto": {{
+    "modo": "ADAPTAR|CREAR",
+    "materia": "string",
+    "nivel": "string",
+    "tema": "string",
+    "estilo_extra": "string"
+  }},
+  "objetivo_aprendizaje": "string",
+  "consigna_adaptada": "string",
+  "items": [
+    {{
+      "tipo": "multiple choice|unir|completar|verdadero_falso|problema_guiado",
+      "enunciado": "string",
+      "opciones": ["string", "string"]
+    }}
+  ],
+  "adecuaciones_aplicadas": ["string", "string"],
+  "sugerencias_docente": ["string", "string"],
+  "visual": {{
+    "habilitado": boolean,
+    "prompt": "string"
+  }},
+  "control_calidad": {{
+    "items_count": number,
+    "incluye_ejemplo": boolean,
+    "lenguaje_concreto": boolean,
+    "una_accion_por_frase": boolean
+  }}
+}}
 
-REGLAS:
-- Copia fiel del 100% de los enunciados del examen (no omitir).
-- No soluciones ni resultados.
-- Pista debe guiar el proceso.
-- Para Grupo A o Dislexia/Discalculia: lenguaje concreto y apoyos simples.
-- Si visual.habilitado=true, visual.prompt debe empezar EXACTAMENTE con:
-  "Dibujo escolar, trazos negros, fondo blanco, estilo simple de: "
-- Todo debe estar DENTRO del JSON.
+REGLAS DURAS:
+1) JSON puro, nada fuera del JSON.
+2) items_count debe coincidir con len(items).
+3) visual.prompt SOLO si visual.habilitado=true y debe empezar EXACTAMENTE con:
+   "{IMAGE_PROMPT_PREFIX}"
+4) Si MODO=ADAPTAR: preservar la intención pedagógica del original; NO copiar texto basura; pero sí mantener lo esencial.
+5) Si MODO=CREAR: construir desde cero basado en el brief.
 """.strip()
 
-def build_prompt_full(nombre: str, diag: str, grupo: str, examen: str) -> str:
-    return f"""{SYSTEM_PROMPT_FULL}
+def build_prompt_opalpp(
+    modo: str,
+    materia: str,
+    nivel: str,
+    tema: str,
+    estilo_extra: str,
+    alumno_nombre: str,
+    alumno_grupo: str,
+    alumno_diag: str,
+    alumno_grado: str,
+    original_text: str
+) -> str:
+    payload = {
+        "MODO": modo,
+        "MATERIA": materia,
+        "NIVEL": nivel,
+        "TEMA": tema,
+        "ESTILO_EXTRA": estilo_extra or "",
+        "ALUMNO": {
+            "nombre": alumno_nombre,
+            "grupo": alumno_grupo,
+            "diagnostico": alumno_diag,
+            "grado": alumno_grado
+        },
+        "ORIGINAL": original_text or ""
+    }
+    # JSON-in-prompt reduce ambigüedad
+    return f"{SYSTEM_PROMPT_OPALPP}\n\nENTRADA:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
 
-ALUMNO:
-- nombre: {nombre}
-- grupo: {grupo}
-- diagnostico: {diag}
-
-EXAMEN:
-{examen}
-""".strip()
-
-def build_prompt_compact(nombre: str, diag: str, grupo: str, examen: str) -> str:
-    # reduce tokens: pistas muy cortas + visual off
+def build_prompt_compact_opalpp(
+    modo: str,
+    materia: str,
+    nivel: str,
+    tema: str,
+    estilo_extra: str,
+    alumno_nombre: str,
+    alumno_grupo: str,
+    alumno_diag: str,
+    alumno_grado: str,
+    original_text: str
+) -> str:
+    # Fallback compacto: menos ítems, sin visual, pistas muy cortas
+    payload = {
+        "MODO": modo,
+        "MATERIA": materia,
+        "NIVEL": nivel,
+        "TEMA": tema,
+        "ESTILO_EXTRA": estilo_extra or "",
+        "ALUMNO": {
+            "nombre": alumno_nombre,
+            "grupo": alumno_grupo,
+            "diagnostico": alumno_diag,
+            "grado": alumno_grado
+        },
+        "ORIGINAL": (original_text or "")[:3000]
+    }
     return f"""
-Devuelve SOLO JSON válido (sin texto extra).
-Pistas MUY cortas (<=120 caracteres). visual siempre false.
+Devuelve SOLO JSON válido.
+Genera max 6 items. Enunciados y consignas breves. visual siempre false.
 
 ESQUEMA:
 {{
- "alumno": {{"nombre":"{nombre}","grupo":"{grupo}","diagnostico":"{diag}"}},
- "documento":[
-  {{"tipo":"consigna","enunciado_original":"literal","pista":"corta","visual":{{"habilitado":false,"prompt":""}}}}
- ]
+  "alumno": {{"nombre":"{alumno_nombre}","grupo":"{alumno_grupo}","diagnostico":"{alumno_diag}","grado":"{alumno_grado}"}},
+  "contexto": {{"modo":"{modo}","materia":"{materia}","nivel":"{nivel}","tema":"{tema}","estilo_extra":"{estilo_extra or ''}"}},
+  "objetivo_aprendizaje":"string",
+  "consigna_adaptada":"string",
+  "items":[{{"tipo":"multiple choice","enunciado":"string","opciones":["A","B"]}}],
+  "adecuaciones_aplicadas":["string"],
+  "sugerencias_docente":["string"],
+  "visual":{{"habilitado":false,"prompt":""}},
+  "control_calidad":{{"items_count":0,"incluye_ejemplo":true,"lenguaje_concreto":true,"una_accion_por_frase":true}}
 }}
 
-REGLAS:
-- Copiar literal cada consigna
-- No soluciones
-- No omitir consignas
-- No markdown
-
-EXAMEN:
-{examen}
+ENTRADA:
+{json.dumps(payload, ensure_ascii=False)}
 """.strip()
 
 def build_repair_prompt(bad: str, why: str) -> str:
@@ -167,7 +257,8 @@ JSON A CORREGIR:
 {bad}
 
 Reglas:
-- Debe cumplir el esquema del sistema
+- Debe cumplir EXACTAMENTE el esquema y reglas del sistema
+- items_count debe coincidir con len(items)
 - No agregues texto fuera del JSON
 """.strip()
 
@@ -226,7 +317,7 @@ def normalize_visual(v: Any) -> Dict[str, Any]:
             "prompt": str(v.get("prompt", "")).strip()}
 
 # ============================================================
-# DOCX extraction (párrafos + tablas, preserva orden)
+# DOCX extraction (párrafos + tablas)
 # ============================================================
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
@@ -254,16 +345,16 @@ def validate_exam_text(exam_text: str) -> Tuple[bool, str, Dict[str, Any]]:
         "chars": len(exam_text or ""),
         "lines": (exam_text or "").count("\n") + (1 if exam_text else 0),
         "pipes": (exam_text or "").count("|"),
-        "preview": (exam_text or "")[:1200],
+        "preview": (exam_text or "")[:1400],
     }
     if not exam_text or not exam_text.strip():
-        return False, "EXAMEN vacío tras extracción (posible texto en imágenes/cuadros).", info
-    if len(exam_text) < 200:
-        return False, "EXAMEN muy corto (<200 chars). Posible doc con imágenes/shapes.", info
+        return False, "TEXTO vacío tras extracción (posible actividad en imágenes/cuadros).", info
+    if len(exam_text) < 150:
+        return False, "TEXTO muy corto (<150 chars). Posible doc con imágenes/shapes.", info
     return True, "OK", info
 
 # ============================================================
-# Model scanning + selection (consultar primero)
+# Model scanning + selection (texto + imagen)
 # ============================================================
 def list_models_generate_content() -> List[str]:
     ms = genai.list_models()
@@ -372,13 +463,10 @@ def forced_boot_scan() -> Dict[str, Any]:
     models = list_models_generate_content()
     if not models:
         raise RuntimeError("No se detectaron modelos con generateContent. API key inválida/limitada o endpoint incompatible.")
-
     text_model = pick_best_text_model(models)
     if not text_model:
         raise RuntimeError("No se pudo seleccionar modelo de texto automáticamente.")
-
     image_model, image_reason = pick_best_image_model(models)
-
     return {
         "models": models,
         "text_model": text_model,
@@ -398,7 +486,7 @@ def boot_or_stop() -> Dict[str, Any]:
 BOOT = boot_or_stop()
 
 # ============================================================
-# Respuesta Gemini: robusto contra finish_reason=2 / sin parts
+# Respuesta Gemini robusta (sin depender de response.text)
 # ============================================================
 def _extract_text_or_none(resp) -> Optional[str]:
     try:
@@ -422,37 +510,33 @@ def _finish_reason(resp) -> Optional[int]:
     except Exception:
         return None
 
-def validate_json_shape(data: Dict[str, Any]) -> Tuple[bool, str]:
+def validate_activity_json(data: Dict[str, Any]) -> Tuple[bool, str]:
     try:
         if PYDANTIC_AVAILABLE:
-            AdecuacionModel.model_validate(data)
+            Activity = ActividadModel.model_validate(data)
+            # items_count must match
+            if Activity.control_calidad.get("items_count") != len(Activity.items):
+                return False, "control_calidad.items_count no coincide con len(items)"
+            # visual prompt rule
+            if Activity.visual.habilitado and Activity.visual.prompt and not Activity.visual.prompt.startswith(IMAGE_PROMPT_PREFIX):
+                return False, "visual.prompt no respeta el prefijo requerido"
             return True, "OK(pydantic)"
+        # Basic validation
         if not isinstance(data, dict):
             return False, "Root no es objeto"
-        if "alumno" not in data or "documento" not in data:
-            return False, "Faltan claves alumno/documento"
-        if not isinstance(data["alumno"], dict):
-            return False, "alumno no es objeto"
-        if not isinstance(data["documento"], list):
-            return False, "documento no es lista"
-        if len(data["documento"]) < 1:
-            return False, "documento vacío"
-        al = data["alumno"]
-        for k in ["nombre", "grupo", "diagnostico"]:
-            if k not in al or not isinstance(al[k], str):
-                return False, f"alumno.{k} inválido"
-        for i, it in enumerate(data["documento"][:200]):
-            if not isinstance(it, dict):
-                return False, f"documento[{i}] no es objeto"
-            for k in ["enunciado_original", "pista", "visual"]:
-                if k not in it:
-                    return False, f"documento[{i}] falta {k}"
-            if not isinstance(it["enunciado_original"], str) or not it["enunciado_original"].strip():
-                return False, f"documento[{i}].enunciado_original vacío"
-            if not isinstance(it["pista"], str) or not it["pista"].strip():
-                return False, f"documento[{i}].pista vacío"
-            if not isinstance(it["visual"], dict):
-                return False, f"documento[{i}].visual no es objeto"
+        for k in ["alumno", "contexto", "objetivo_aprendizaje", "consigna_adaptada", "items", "adecuaciones_aplicadas", "sugerencias_docente", "visual", "control_calidad"]:
+            if k not in data:
+                return False, f"Falta clave: {k}"
+        if not isinstance(data["items"], list) or len(data["items"]) < 1:
+            return False, "items vacío/no lista"
+        cc = data.get("control_calidad", {})
+        if cc.get("items_count") != len(data["items"]):
+            return False, "control_calidad.items_count no coincide con len(items)"
+        v = data.get("visual", {})
+        if normalize_bool(v.get("habilitado", False)):
+            p = str(v.get("prompt", "")).strip()
+            if p and not p.startswith(IMAGE_PROMPT_PREFIX):
+                return False, "visual.prompt no respeta el prefijo requerido"
         return True, "OK(basic)"
     except Exception as e:
         return False, f"Exception validando: {e}"
@@ -469,15 +553,13 @@ def generate_json_once(model_id: str, prompt: str, max_out: int) -> Dict[str, An
     return json.loads(text)
 
 def generate_json_with_repair(model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
-    # intento 1
     try:
         data = generate_json_once(model_id, prompt, max_out)
-        ok, why = validate_json_shape(data)
+        ok, why = validate_activity_json(data)
         if ok:
             return data
         raise ValueError(f"JSON inválido: {why}")
     except Exception as e:
-        # reparación 1 vez
         m = genai.GenerativeModel(model_id)
         cfg = dict(BASE_GEN_CFG_JSON)
         cfg["max_output_tokens"] = max_out
@@ -496,45 +578,36 @@ def generate_json_with_repair(model_id: str, prompt: str, max_out: int) -> Dict[
         if raw2 is None:
             raise ValueError(f"Empty candidate after repair (finish_reason={fr2})")
         data2 = json.loads(raw2)
-        ok2, why2 = validate_json_shape(data2)
+        ok2, why2 = validate_activity_json(data2)
         if not ok2:
             raise ValueError(f"JSON reparado inválido: {why2}")
         return data2
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def cached_generate_json(cache_key: str, model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
-    # cachea el resultado final ya validado
+def cached_generate_activity(cache_key: str, model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
     data = generate_json_with_repair(model_id, prompt, max_out)
     return data
 
-def request_json_ultra(model_id: str, prompt_full: str, prompt_compact: str, cache_key: str) -> Tuple[Dict[str, Any], str, int]:
-    """
-    Devuelve (data, mode, max_tokens_used)
-    mode: FULL / COMPACT
-    """
-    # FULL escalado
+def request_activity_ultra(model_id: str, prompt_full: str, prompt_compact: str, cache_key: str) -> Tuple[Dict[str, Any], str, int]:
     last_err = None
     for t in OUT_TOKEN_STEPS_FULL:
         try:
-            data = cached_generate_json(cache_key + f"::FULL::{t}", model_id, prompt_full, t)
+            data = cached_generate_activity(cache_key + f"::FULL::{t}", model_id, prompt_full, t)
             return data, "FULL", t
         except Exception as e:
             last_err = e
             continue
-
-    # COMPACT fallback
     for t in OUT_TOKEN_STEPS_COMPACT:
         try:
-            data = cached_generate_json(cache_key + f"::COMPACT::{t}", model_id, prompt_compact, t)
+            data = cached_generate_activity(cache_key + f"::COMPACT::{t}", model_id, prompt_compact, t)
             return data, "COMPACT", t
         except Exception as e:
             last_err = e
             continue
-
-    raise last_err if last_err else RuntimeError("Fallo desconocido solicitando JSON")
+    raise last_err if last_err else RuntimeError("Fallo desconocido generando actividad")
 
 # ============================================================
-# Imagen (best effort)
+# Imagen (best effort + validación bytes)
 # ============================================================
 def generar_imagen_ia(model_id: str, prompt_img: str) -> Optional[io.BytesIO]:
     try:
@@ -548,14 +621,38 @@ def generar_imagen_ia(model_id: str, prompt_img: str) -> Optional[io.BytesIO]:
         return None
 
 # ============================================================
-# Render DOCX (inclusivo)
+# Render DOCX (Opal++): layout dyslexia-friendly
+# - Verdana 14, line spacing 1.8
+# - Secciones: Objetivo, Consigna, Actividad, Adecuaciones, Sugerencias
+# - Items con checkboxes visuales
 # ============================================================
-def renderizar_adecuacion(data_json: Dict[str, Any], logo_bytes: Optional[bytes], activar_img: bool, model_img_id: Optional[str]) -> bytes:
+def _add_heading(doc: Document, text: str):
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.bold = True
+    run.font.size = Pt(14)
+    p.paragraph_format.space_before = Pt(10)
+    p.paragraph_format.space_after = Pt(4)
+    p.paragraph_format.line_spacing = 1.2
+
+def _add_block(doc: Document, text: str, line_spacing: float = 1.8):
+    p = doc.add_paragraph(text)
+    p.paragraph_format.line_spacing = line_spacing
+    p.paragraph_format.space_after = Pt(6)
+    return p
+
+def render_docx_opalpp(
+    data: Dict[str, Any],
+    logo_bytes: Optional[bytes],
+    activar_img: bool,
+    model_img_id: Optional[str]
+) -> bytes:
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Verdana"
-    style.font.size = Pt(11)
+    style.font.size = Pt(14)
 
+    # Header
     header = doc.add_table(rows=1, cols=2)
     if logo_bytes:
         try:
@@ -565,93 +662,139 @@ def renderizar_adecuacion(data_json: Dict[str, Any], logo_bytes: Optional[bytes]
 
     info = header.rows[0].cells[1].paragraphs[0]
     info.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    al = data_json.get("alumno", {})
-    info.add_run(f"ALUMNO: {al.get('nombre','')}\nGRUPO: {al.get('grupo','')} | APOYO: {al.get('diagnostico','')}").bold = True
+    al = data.get("alumno", {})
+    ctx = data.get("contexto", {})
+    info_run = info.add_run(
+        f"ALUMNO: {al.get('nombre','')}\n"
+        f"GRADO: {al.get('grado','')} | GRUPO: {al.get('grupo','')}\n"
+        f"APOYO: {al.get('diagnostico','')}\n"
+        f"MATERIA: {ctx.get('materia','')} | TEMA: {ctx.get('tema','')}"
+    )
+    info_run.bold = True
 
-    for item in data_json.get("documento", []):
-        if not isinstance(item, dict):
-            continue
-        enun = str(item.get("enunciado_original", "")).strip()
-        pista = str(item.get("pista", "")).strip()
-        visual = normalize_visual(item.get("visual", {}))
+    # Secciones
+    _add_heading(doc, "Objetivo de aprendizaje")
+    _add_block(doc, str(data.get("objetivo_aprendizaje", "")).strip())
 
-        p_orig = doc.add_paragraph(enun)
-        p_orig.paragraph_format.line_spacing = 1.5
+    _add_heading(doc, "Consigna adaptada")
+    _add_block(doc, str(data.get("consigna_adaptada", "")).strip())
 
-        p_pista = doc.add_paragraph()
-        run = p_pista.add_run(f"💡 {pista}")
-        run.font.color.rgb = RGBColor(0, 128, 0)
-        run.italic = True
-        run.font.size = Pt(10)
+    _add_heading(doc, "Actividad / Ítems")
+    items = data.get("items", [])
+    for idx, it in enumerate(items, start=1):
+        tipo = str(it.get("tipo", "")).strip()
+        enun = str(it.get("enunciado", "")).strip()
+        opts = it.get("opciones", []) if isinstance(it.get("opciones", []), list) else []
 
-        if activar_img and model_img_id and visual.get("habilitado"):
-            pv = str(visual.get("prompt", "")).strip()
-            if pv:
-                if not pv.startswith(IMAGE_PROMPT_PREFIX):
-                    pv = IMAGE_PROMPT_PREFIX + pv
-                img_data = generar_imagen_ia(model_img_id, pv)
-                if img_data:
-                    pic = doc.add_paragraph()
-                    pic.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    try:
-                        pic.add_run().add_picture(img_data, width=Inches(2.5))
-                    except Exception:
-                        pass
+        p = doc.add_paragraph()
+        p.paragraph_format.line_spacing = 1.8
+        r1 = p.add_run(f"{idx}. ")
+        r1.bold = True
+        r2 = p.add_run(enun)
+        r2.bold = True  # keyword emphasis; enunciado completo en negrita ayuda foco en dislexia
+
+        p2 = doc.add_paragraph(f"Tipo: {tipo}")
+        p2.paragraph_format.line_spacing = 1.6
+
+        if opts:
+            for op in opts[:10]:
+                po = doc.add_paragraph(f"☐ {op}")
+                po.paragraph_format.line_spacing = 1.6
+        else:
+            # Línea de respuesta
+            _add_block(doc, "Respuesta: ________________________________", line_spacing=1.6)
 
         doc.add_paragraph("")
+
+    _add_heading(doc, "Adecuaciones aplicadas")
+    for a in (data.get("adecuaciones_aplicadas", []) or [])[:20]:
+        pa = doc.add_paragraph(f"• {a}")
+        pa.paragraph_format.line_spacing = 1.6
+
+    _add_heading(doc, "Sugerencias para el docente")
+    for s in (data.get("sugerencias_docente", []) or [])[:20]:
+        ps = doc.add_paragraph(f"• {s}")
+        ps.paragraph_format.line_spacing = 1.6
+
+    # Imagen
+    v = normalize_visual(data.get("visual", {}))
+    if activar_img and model_img_id and v.get("habilitado") and v.get("prompt"):
+        pv = str(v.get("prompt", "")).strip()
+        if pv and not pv.startswith(IMAGE_PROMPT_PREFIX):
+            pv = IMAGE_PROMPT_PREFIX + pv
+        img = generar_imagen_ia(model_img_id, pv)
+        if img:
+            pic = doc.add_paragraph()
+            pic.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            try:
+                pic.add_run().add_picture(img, width=Inches(2.7))
+            except Exception:
+                pass
 
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
 
 # ============================================================
-# Diagnóstico (DOCX + JSON)
+# Diagnóstico (entrada + JSON)
 # ============================================================
-def run_diagnostic(exam_text: str, df_rows: pd.DataFrame, alumno_col: str, grupo_col: str, diag_col: str) -> Dict[str, Any]:
-    ok_exam, msg_exam, info_exam = validate_exam_text(exam_text)
+def run_diagnostic_activity(
+    modo: str,
+    materia: str,
+    nivel: str,
+    tema: str,
+    estilo_extra: str,
+    original_text: str,
+    df_rows: pd.DataFrame,
+    alumno_col: str,
+    grupo_col: str,
+    diag_col: str,
+    grado_text: str
+) -> Dict[str, Any]:
+    ok_in, msg_in, info_in = validate_exam_text(original_text) if modo == "ADAPTAR" else (True, "OK", {
+        "chars": len(original_text or ""),
+        "lines": (original_text or "").count("\n") + (1 if original_text else 0),
+        "pipes": (original_text or "").count("|"),
+        "preview": (original_text or "")[:1400],
+    })
+
     out: Dict[str, Any] = {
-        "exam_ok": ok_exam,
-        "exam_msg": msg_exam,
-        "exam_info": info_exam,
+        "input_ok": ok_in,
+        "input_msg": msg_in,
+        "input_info": info_in,
         "json_ok": False,
         "json_msg": "",
         "json_preview": "",
-        "json_counts": {},
         "mode": "",
         "max_tokens": 0,
         "model_text": BOOT["text_model"],
         "model_image": BOOT.get("image_model"),
     }
-    if not ok_exam:
+    if not ok_in:
         return out
-
     if len(df_rows) == 0:
         out["json_ok"] = False
         out["json_msg"] = "No hay alumnos para probar JSON."
         return out
 
-    # toma el primer alumno
     row = df_rows.iloc[0]
     n = str(row[alumno_col]).strip()
     g = str(row[grupo_col]).strip()
     d = str(row[diag_col]).strip()
 
-    prompt_full = build_prompt_full(n, d, g, exam_text)
-    prompt_comp = build_prompt_compact(n, d, g, exam_text)
-    cache_key = f"DIAG::{hash_text(exam_text)}::{BOOT['text_model']}::{n}::{g}::{d}"
+    prompt_full = build_prompt_opalpp(modo, materia, nivel, tema, estilo_extra, n, g, d, grado_text, original_text)
+    prompt_comp = build_prompt_compact_opalpp(modo, materia, nivel, tema, estilo_extra, n, g, d, grado_text, original_text)
+
+    cache_key = f"DIAG::{hash_text(modo + materia + nivel + tema + estilo_extra + (original_text or ''))}::{BOOT['text_model']}::{n}::{g}::{d}::{grado_text}"
 
     try:
-        data, mode, max_t = request_json_ultra(BOOT["text_model"], prompt_full, prompt_comp, cache_key)
-        okj, whyj = validate_json_shape(data)
+        data, mode_used, max_t = request_activity_ultra(BOOT["text_model"], prompt_full, prompt_comp, cache_key)
+        okj, whyj = validate_activity_json(data)
         out["json_ok"] = okj
         out["json_msg"] = whyj
-        out["mode"] = mode
+        out["mode"] = mode_used
         out["max_tokens"] = max_t
-        out["json_counts"] = {
-            "documento_len": len(data.get("documento", [])) if isinstance(data, dict) else 0
-        }
-        # preview seguro
-        out["json_preview"] = json.dumps(data, ensure_ascii=False, indent=2)[:2500]
+        out["json_preview"] = json.dumps(data, ensure_ascii=False, indent=2)[:2800]
         return out
     except Exception as e:
         out["json_ok"] = False
@@ -659,44 +802,13 @@ def run_diagnostic(exam_text: str, df_rows: pd.DataFrame, alumno_col: str, grupo
         return out
 
 # ============================================================
-# BOOT (consultar primero)
-# ============================================================
-@st.cache_resource(show_spinner=False)
-def forced_boot_scan() -> Dict[str, Any]:
-    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    models = list_models_generate_content()
-    if not models:
-        raise RuntimeError("No se detectaron modelos con generateContent. API key inválida/limitada o endpoint incompatible.")
-    text_model = pick_best_text_model(models)
-    if not text_model:
-        raise RuntimeError("No se pudo seleccionar modelo de texto automáticamente.")
-    image_model, image_reason = pick_best_image_model(models)
-    return {
-        "models": models,
-        "text_model": text_model,
-        "image_model": image_model,
-        "image_reason": image_reason,
-        "boot_time": now_str(),
-    }
-
-def boot_or_stop() -> Dict[str, Any]:
-    try:
-        return forced_boot_scan()
-    except Exception as e:
-        st.error("Fallo en arranque (escaneo forzado de modelos). La app no continuará.")
-        st.code(f"{type(e).__name__}: {e}")
-        st.stop()
-
-BOOT = boot_or_stop()
-
-# ============================================================
 # UI + Proceso
 # ============================================================
 def main():
-    st.title("Motor Pedagógico Determinista v16.0")
-    st.caption("Incluye diagnóstico de parseo (DOCX + JSON) y resiliencia ante MAX_TOKENS.")
+    st.title("Motor Pedagógico v17.0 (Opal++)")
+    st.caption("Adaptar desde DOCX o Crear desde brief. Salida inclusiva con JSON determinista y DOCX dyslexia-friendly.")
 
-    # Cargar planilla
+    # Planilla
     try:
         df = pd.read_csv(URL_PLANILLA)
         df.columns = [c.strip() for c in df.columns]
@@ -704,91 +816,149 @@ def main():
         st.error(f"Error cargando planilla: {e}")
         return
 
-    # Column mapping por posición (compatibilidad con tu esquema)
+    # Column mapping por posición (compat)
     grado_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
     alumno_col = df.columns[2] if len(df.columns) > 2 else df.columns[0]
     grupo_col = df.columns[3] if len(df.columns) > 3 else df.columns[0]
     diag_col = df.columns[4] if len(df.columns) > 4 else df.columns[0]
 
     with st.sidebar:
-        st.header("Arranque (consultar primero)")
+        st.header("Modelos (auto)")
         st.write(f"Boot: {BOOT.get('boot_time')}")
-        st.write(f"Modelo texto (auto): {BOOT.get('text_model')}")
+        st.write(f"Texto: {BOOT.get('text_model')}")
         if BOOT.get("image_model"):
-            st.write(f"Modelo imagen (auto): {BOOT.get('image_model')}")
+            st.write(f"Imagen: {BOOT.get('image_model')}")
             st.caption(BOOT.get("image_reason", ""))
         else:
-            st.write("Modelo imagen (auto): N/A")
+            st.write("Imagen: N/A")
             st.caption(BOOT.get("image_reason", ""))
 
         st.divider()
-        st.header("Selección")
-        grado = st.selectbox("Grado", sorted(df[grado_col].dropna().unique().tolist()))
-        df_f = df[df[grado_col] == grado].copy()
+        st.header("Selección grupo")
+        grado_sel = st.selectbox("Grado (planilla)", sorted(df[grado_col].dropna().unique().tolist()))
+        df_f = df[df[grado_col] == grado_sel].copy()
 
-        alcance = st.radio("Adecuar para:", ["Todo el grado", "Seleccionar alumnos"], horizontal=True)
+        alcance = st.radio("Alcance", ["Todo el grado", "Seleccionar alumnos"], horizontal=True)
         alumnos_lista = df_f[alumno_col].dropna().unique().tolist()
         if alcance == "Seleccionar alumnos":
             seleccion = st.multiselect("Alumnos", alumnos_lista)
-            if seleccion:
-                alumnos_final = df_f[df_f[alumno_col].isin(seleccion)].copy()
-            else:
-                alumnos_final = df_f.iloc[0:0].copy()
-                st.info("Seleccioná al menos 1 alumno para procesar.")
+            alumnos_final = df_f[df_f[alumno_col].isin(seleccion)].copy() if seleccion else df_f.iloc[0:0].copy()
+            if len(alumnos_final) == 0:
+                st.info("Seleccioná al menos 1 alumno.")
         else:
             alumnos_final = df_f
 
         st.divider()
-        st.header("Salida / Assets")
-        activar_img_user = st.checkbox("Generar imágenes IA (si disponible)", value=True)
+        st.header("Modo de entrada")
+        modo = st.radio("Elegí modo", ["ADAPTAR (subir DOCX)", "CREAR (solo brief)"])
+        modo_key = "ADAPTAR" if modo.startswith("ADAPTAR") else "CREAR"
+
+        st.divider()
+        st.header("Contexto pedagógico")
+        materia = st.text_input("Materia", value="Matemática")
+        nivel = st.text_input("Nivel", value="7mo grado")
+        tema = st.text_input("Tema", value="División progresiva")
+        estilo_extra = st.text_area("Instrucciones extra (opcional)", placeholder="Ej: incluir verdadero/falso + 1 ejemplo guiado, y reducir a 6 ítems.")
+
+        st.divider()
+        st.header("Assets / salida")
+        activar_img_user = st.checkbox("Generar imagen de apoyo (si disponible)", value=True)
         activar_img = activar_img_user and (BOOT.get("image_model") is not None)
         if activar_img_user and not activar_img:
-            st.warning("Imágenes desactivadas: no se detectó un modelo de imagen funcional en tu cuenta.")
+            st.warning("Imágenes desactivadas: no se detectó un modelo de imagen funcional.")
 
         logo = st.file_uploader("Logo", type=["png", "jpg", "jpeg"])
-        l_bytes = logo.read() if logo else None
+        logo_bytes = logo.read() if logo else None
 
         st.divider()
         st.header("Diagnóstico")
-        diag_mode = st.checkbox("Activar modo diagnóstico", value=True)
+        diag_mode = st.checkbox("Activar diagnóstico", value=True)
         st.caption(f"Pydantic: {'ON' if PYDANTIC_AVAILABLE else 'OFF'}")
 
-    archivo = st.file_uploader("Subir Examen Base (DOCX)", type=["docx"])
-    if not archivo:
-        return
+    st.subheader("Entrada")
+    original_text = ""
 
-    # Extrae examen una sola vez
-    txt_base = extraer_texto_docx(archivo)
-    ok_exam, msg_exam, info_exam = validate_exam_text(txt_base)
-
-    if diag_mode:
-        st.subheader("Diagnóstico de parseo")
-        if ok_exam:
-            st.success(f"Parseo DOCX: OK ({info_exam['chars']} chars, {info_exam['lines']} líneas)")
+    if modo_key == "ADAPTAR":
+        archivo = st.file_uploader("Subir actividad/examen base (DOCX)", type=["docx"])
+        if archivo:
+            original_text = extraer_texto_docx(archivo)
+            ok_in, msg_in, info_in = validate_exam_text(original_text)
+            if diag_mode:
+                if ok_in:
+                    st.success(f"Parseo DOCX: OK ({info_in['chars']} chars, {info_in['lines']} líneas)")
+                else:
+                    st.error(f"Parseo DOCX: {msg_in}")
+                with st.expander("Preview texto extraído", expanded=False):
+                    st.text(info_in.get("preview", ""))
         else:
-            st.error(f"Parseo DOCX: {msg_exam}")
-
-        with st.expander("Preview texto extraído (primeros ~1200 chars)", expanded=False):
-            st.text(info_exam.get("preview", ""))
-
-        if st.button("Probar parseo JSON (primer alumno)", disabled=(not ok_exam or len(alumnos_final) == 0)):
-            dres = run_diagnostic(txt_base, alumnos_final, alumno_col, grupo_col, diag_col)
-            if dres["json_ok"]:
-                st.success(f"JSON: OK | mode={dres['mode']} | max_tokens={dres['max_tokens']} | documento={dres['json_counts'].get('documento_len')}")
+            st.info("Subí un DOCX para adaptar.")
+    else:
+        brief = st.text_area(
+            "Brief de actividad (texto libre)",
+            placeholder="Ej: Matemática 7mo grado. División progresiva. 1 ejemplo guiado. 6 ejercicios. 2 de selección múltiple y 2 de completar."
+        )
+        original_text = (brief or "").strip()
+        if diag_mode:
+            if original_text:
+                st.success(f"Brief: OK ({len(original_text)} chars)")
+                with st.expander("Preview brief", expanded=False):
+                    st.text(original_text[:1400])
             else:
-                st.error(f"JSON: {dres['json_msg']}")
-            with st.expander("Preview JSON (truncado)", expanded=False):
-                st.text(dres.get("json_preview", ""))
+                st.error("Brief vacío. Escribí una descripción.")
 
-    if st.button("🚀 INICIAR PROCESAMIENTO", disabled=(not ok_exam or len(alumnos_final) == 0)):
-        if not ok_exam:
-            st.error(f"No se inicia: {msg_exam}")
-            return
+    # Diagnóstico JSON
+    if diag_mode and st.button("Probar generación (primer alumno)"):
+        if len(alumnos_final) == 0:
+            st.error("No hay alumnos para probar.")
+        else:
+            if modo_key == "ADAPTAR":
+                ok_in, msg_in, _ = validate_exam_text(original_text)
+                if not ok_in:
+                    st.error(f"No se puede probar: {msg_in}")
+                else:
+                    dres = run_diagnostic_activity(modo_key, materia, nivel, tema, estilo_extra, original_text, alumnos_final, alumno_col, grupo_col, diag_col, str(grado_sel))
+                    if dres["json_ok"]:
+                        st.success(f"JSON OK | mode={dres['mode']} | max_tokens={dres['max_tokens']}")
+                    else:
+                        st.error(f"JSON FAIL: {dres['json_msg']}")
+                    with st.expander("Preview JSON (truncado)", expanded=False):
+                        st.text(dres.get("json_preview", ""))
+            else:
+                if not original_text:
+                    st.error("Brief vacío.")
+                else:
+                    dres = run_diagnostic_activity(modo_key, materia, nivel, tema, estilo_extra, original_text, alumnos_final, alumno_col, grupo_col, diag_col, str(grado_sel))
+                    if dres["json_ok"]:
+                        st.success(f"JSON OK | mode={dres['mode']} | max_tokens={dres['max_tokens']}")
+                    else:
+                        st.error(f"JSON FAIL: {dres['json_msg']}")
+                    with st.expander("Preview JSON (truncado)", expanded=False):
+                        st.text(dres.get("json_preview", ""))
+
+    # Procesamiento lote
+    if st.button("🚀 GENERAR LOTE (ZIP)"):
         if len(alumnos_final) == 0:
             st.error("No hay alumnos para procesar (selección vacía).")
             return
 
-        exam_hash = hash_text(txt_base)
+        if modo_key == "ADAPTAR":
+            ok_in, msg_in, info_in = validate_exam_text(original_text)
+            if not ok_in:
+                st.error(f"No se inicia: {msg_in}")
+                return
+            input_hash = hash_text(original_text)
+        else:
+            if not original_text:
+                st.error("Brief vacío. No se inicia.")
+                return
+            info_in = {
+                "chars": len(original_text),
+                "lines": original_text.count("\n") + 1,
+                "pipes": original_text.count("|"),
+                "preview": original_text[:1400],
+            }
+            input_hash = hash_text(original_text)
+
         model_text = BOOT["text_model"]
         model_img = BOOT.get("image_model") if activar_img else None
 
@@ -797,16 +967,19 @@ def main():
         errors: List[str] = []
         ok_count = 0
 
-        logs.append(f"Motor Pedagógico v16.0")
+        logs.append("Motor Pedagógico v17.0 (Opal++)")
         logs.append(f"Inicio: {now_str()}")
+        logs.append(f"Modo: {modo_key}")
+        logs.append(f"Materia: {materia} | Nivel: {nivel} | Tema: {tema}")
+        logs.append(f"Estilo extra: {estilo_extra}")
         logs.append(f"Modelo texto: {model_text}")
         logs.append(f"Modelo imagen: {model_img if model_img else 'N/A'}")
         logs.append(f"Imágenes habilitadas: {bool(model_img)}")
-        logs.append(f"Grado: {grado}")
+        logs.append(f"Grado planilla: {grado_sel}")
         logs.append(f"Total alumnos: {len(alumnos_final)}")
-        logs.append(f"Hash examen: {exam_hash}")
+        logs.append(f"Hash entrada: {input_hash}")
         logs.append(f"Pydantic: {'ON' if PYDANTIC_AVAILABLE else 'OFF'}")
-        logs.append(f"DOCX chars: {info_exam.get('chars')} | líneas: {info_exam.get('lines')} | pipes: {info_exam.get('pipes')}")
+        logs.append(f"Entrada chars: {info_in.get('chars')} | líneas: {info_in.get('lines')} | pipes: {info_in.get('pipes')}")
         logs.append("")
 
         with zipfile.ZipFile(zip_io, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -821,25 +994,60 @@ def main():
                 g = str(row[grupo_col]).strip()
                 d = str(row[diag_col]).strip()
 
-                status.info(f"Procesando: {n} ({i}/{total})")
+                status.info(f"Generando: {n} ({i}/{total})")
 
                 try:
-                    prompt_full = build_prompt_full(n, d, g, txt_base)
-                    prompt_comp = build_prompt_compact(n, d, g, txt_base)
-                    cache_key = f"{exam_hash}::{model_text}::{n}::{g}::{d}"
-
-                    data, mode, max_t = request_json_ultra(model_text, prompt_full, prompt_comp, cache_key)
-
-                    docx_bytes = renderizar_adecuacion(
-                        data_json=data,
-                        logo_bytes=l_bytes,
-                        activar_img=bool(model_img),
-                        model_img_id=model_img
+                    prompt_full = build_prompt_opalpp(
+                        modo_key, materia, nivel, tema, estilo_extra,
+                        alumno_nombre=n,
+                        alumno_grupo=g,
+                        alumno_diag=d,
+                        alumno_grado=str(grado_sel),
+                        original_text=original_text
                     )
-                    zf.writestr(f"Adecuacion_{safe_filename(n)}.docx", docx_bytes)
-                    ok_count += 1
+                    prompt_comp = build_prompt_compact_opalpp(
+                        modo_key, materia, nivel, tema, estilo_extra,
+                        alumno_nombre=n,
+                        alumno_grupo=g,
+                        alumno_diag=d,
+                        alumno_grado=str(grado_sel),
+                        original_text=original_text
+                    )
 
-                    zf.writestr(f"_META_{safe_filename(n)}.txt", f"mode={mode}\nmax_tokens={max_t}\n")
+                    cache_key = f"{input_hash}::{model_text}::{modo_key}::{materia}::{nivel}::{tema}::{estilo_extra}::{n}::{g}::{d}::{grado_sel}"
+
+                    data, mode_used, max_t = request_activity_ultra(model_text, prompt_full, prompt_comp, cache_key)
+
+                    # Inyecta alumno/contexto si el modelo omitió algo mínimo (robustez extra)
+                    data.setdefault("alumno", {})
+                    data["alumno"].setdefault("nombre", n)
+                    data["alumno"].setdefault("grupo", g)
+                    data["alumno"].setdefault("diagnostico", d)
+                    data["alumno"].setdefault("grado", str(grado_sel))
+                    data.setdefault("contexto", {})
+                    data["contexto"].setdefault("modo", modo_key)
+                    data["contexto"].setdefault("materia", materia)
+                    data["contexto"].setdefault("nivel", nivel)
+                    data["contexto"].setdefault("tema", tema)
+                    data["contexto"].setdefault("estilo_extra", estilo_extra or "")
+
+                    # Normaliza visual
+                    v = normalize_visual(data.get("visual", {}))
+                    if v.get("habilitado"):
+                        pv = str(v.get("prompt", "")).strip()
+                        if pv and not pv.startswith(IMAGE_PROMPT_PREFIX):
+                            v["prompt"] = IMAGE_PROMPT_PREFIX + pv
+                    data["visual"] = v
+
+                    okj, whyj = validate_activity_json(data)
+                    if not okj:
+                        raise ValueError(f"JSON final inválido: {whyj}")
+
+                    docx_bytes = render_docx_opalpp(data, logo_bytes, activar_img=bool(model_img), model_img_id=model_img)
+                    zf.writestr(f"Actividad_{safe_filename(n)}.docx", docx_bytes)
+
+                    zf.writestr(f"_META_{safe_filename(n)}.txt", f"mode={mode_used}\nmax_tokens={max_t}\nitems={len(data.get('items',[]))}\n")
+                    ok_count += 1
 
                 except Exception as e:
                     msg = f"{n} :: {type(e).__name__} :: {e}"
@@ -851,8 +1059,7 @@ def main():
             resumen = []
             resumen.append("RESUMEN")
             resumen.append(f"Fin: {now_str()}")
-            resumen.append(f"Procesados: {total}")
-            resumen.append(f"OK: {ok_count}")
+            resumen.append(f"OK: {ok_count} / {total}")
             resumen.append(f"Errores: {len(errors)}")
             if errors:
                 resumen.append("")
@@ -863,7 +1070,7 @@ def main():
             zf.writestr("_RESUMEN.txt", "\n".join(resumen))
 
         st.success(f"Lote finalizado. OK: {ok_count} | Errores: {len(errors)}")
-        st.download_button("📥 Descargar Adecuaciones (ZIP)", zip_io.getvalue(), "adecuaciones_v16_0.zip", mime="application/zip")
+        st.download_button("📥 Descargar ZIP", zip_io.getvalue(), "actividades_opalpp_v17_0.zip", mime="application/zip")
 
 if __name__ == "__main__":
     main()
