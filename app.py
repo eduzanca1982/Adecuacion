@@ -20,20 +20,23 @@ from docx.oxml import OxmlElement
 
 
 # ============================================================
-# Nano Opal v24.1
-# Cambios vs v24.0:
-# - "Sugerencias para el docente" y "Adecuaciones aplicadas" NO se muestran al alumno.
-#   Se mueven al Solucionario DOCENTE únicamente.
-# - Mantiene imágenes (best-effort) y todo lo robusto de v24.0.
+# Nano Opal v24.2
+# - Sanitización robusta de JSON antes de json.loads()
+# - Parse-fix automático (modelo) si falla el parseo
+# - Repair automático si el JSON no cumple esquema/reglas
+# - Alumno NO ve sugerencias/adecuaciones (solo en Solucionario)
+# - Imágenes best-effort por ítem (con smoke test)
+# - Boot real: listar modelos + smoke test antes de operar
+# - ZIP siempre incluye _REPORTE.txt y _RESUMEN.txt
 # ============================================================
 
-st.set_page_config(page_title="Nano Opal v24.1 🍌", layout="wide", page_icon="🍌")
+st.set_page_config(page_title="Nano Opal v24.2 🍌", layout="wide", page_icon="🍌")
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
 RETRIES = 6
-CACHE_TTL_SECONDS = 6 * 60 * 60
+CACHE_TTL_SECONDS = 6 * 60 * 60  # cache de generación
 
 MIN_IMAGE_BYTES = 1200
 IMAGE_PROMPT_PREFIX = "Pictograma estilo ARASAAC, trazos negros gruesos, fondo blanco, ultra simple, sin sombras de: "
@@ -70,7 +73,7 @@ ACTION_EMOJI_BY_TIPO = {
     "arte": "🎨",
 }
 
-SYSTEM_PROMPT_OPAL_V241 = f"""
+SYSTEM_PROMPT_OPAL_V242 = f"""
 Actúa como un Senior Inclusive UX Designer y Tutor Psicopedagogo.
 
 Objetivo: producir una ficha de 60 minutos neuroinclusiva (TDAH/dislexia friendly) con estética tipo "Card",
@@ -134,8 +137,10 @@ ESQUEMA EXACTO:
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
 
 def safe_filename(name: str) -> str:
     s = str(name).strip().replace(" ", "_")
@@ -145,6 +150,7 @@ def safe_filename(name: str) -> str:
         s = s.replace("__", "_")
     return (s or "SIN_NOMBRE")[:120]
 
+
 def _is_retryable_error(e: Exception) -> bool:
     s = str(e).lower()
     markers = [
@@ -153,6 +159,7 @@ def _is_retryable_error(e: Exception) -> bool:
         "connection reset", "temporarily", "service unavailable"
     ]
     return any(m in s for m in markers)
+
 
 def retry_with_backoff(fn):
     last = None
@@ -167,6 +174,7 @@ def retry_with_backoff(fn):
             time.sleep(min(sleep, 30))
     raise last
 
+
 def normalize_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
@@ -175,6 +183,7 @@ def normalize_bool(v: Any) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in {"true", "1", "yes", "y", "si", "sí"}
     return False
+
 
 def ensure_action_emoji(tipo: str, enunciado: str) -> str:
     t = (tipo or "").strip().lower()
@@ -186,6 +195,7 @@ def ensure_action_emoji(tipo: str, enunciado: str) -> str:
     emoji = ACTION_EMOJI_BY_TIPO.get(t, "📖")
     return f"{emoji} {e}"
 
+
 def normalize_visual_prompt(p: str) -> str:
     p = (p or "").strip()
     if not p:
@@ -193,6 +203,7 @@ def normalize_visual_prompt(p: str) -> str:
     if p.startswith(IMAGE_PROMPT_PREFIX):
         return p
     return IMAGE_PROMPT_PREFIX + p
+
 
 def validate_text_input(text: str, mode: str) -> Tuple[bool, str, Dict[str, Any]]:
     info = {
@@ -212,12 +223,76 @@ def validate_text_input(text: str, mode: str) -> Tuple[bool, str, Dict[str, Any]
 
 
 # ============================================================
+# JSON sanitization + parsing
+# ============================================================
+_JSON_CODEFENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+_TRAILING_COMMA_OBJ_RE = re.compile(r",\s*}")
+_TRAILING_COMMA_ARR_RE = re.compile(r",\s*]")
+_SINGLELINE_COMMENT_RE = re.compile(r"//.*?$", re.MULTILINE)
+_BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/", re.MULTILINE)
+
+_UNQUOTED_KEY_RE = re.compile(r'(\{|,)\s*([A-Za-z_][A-Za-z0-9_ ]{{0,60}}?)\s*:')
+
+
+def _strip_wrappers(raw: str) -> str:
+    if not raw:
+        return raw
+    m = _JSON_CODEFENCE_RE.search(raw)
+    if m:
+        raw = m.group(1)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return raw.strip()
+    return raw[start:end + 1].strip()
+
+
+def _fix_unquoted_keys(s: str) -> str:
+    def repl(m):
+        prefix = m.group(1)
+        key = m.group(2).strip()
+        key = re.sub(r"\s+", "_", key)
+        return f'{prefix} "{key}":'
+    return _UNQUOTED_KEY_RE.sub(repl, s)
+
+
+def sanitize_json_text(raw_text: str) -> str:
+    if not raw_text:
+        return raw_text
+    s = raw_text
+    s = _strip_wrappers(s)
+    s = _BLOCK_COMMENT_RE.sub("", s)
+    s = _SINGLELINE_COMMENT_RE.sub("", s)
+    s = _TRAILING_COMMA_OBJ_RE.sub("}", s)
+    s = _TRAILING_COMMA_ARR_RE.sub("]", s)
+    s = _fix_unquoted_keys(s)
+    return s.strip()
+
+
+def safe_json_loads(raw_text: str) -> Dict[str, Any]:
+    if not raw_text:
+        raise ValueError("Empty JSON text")
+
+    cleaned = sanitize_json_text(raw_text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        cleaned2 = _strip_wrappers(cleaned)
+        cleaned2 = _TRAILING_COMMA_OBJ_RE.sub("}", cleaned2)
+        cleaned2 = _TRAILING_COMMA_ARR_RE.sub("]", cleaned2)
+        cleaned2 = _fix_unquoted_keys(cleaned2)
+        return json.loads(cleaned2)
+
+
+# ============================================================
 # DOCX extraction (párrafos + tablas)
 # ============================================================
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
+
 def _extract_text_from_el(el) -> str:
     return "".join(n.text for n in el.iter() if n.tag == f"{W_NS}t" and n.text).strip()
+
 
 def extraer_texto_docx(file) -> str:
     doc = Document(file)
@@ -228,7 +303,7 @@ def extraer_texto_docx(file) -> str:
             if t:
                 out.append(t)
         elif el.tag == f"{W_NS}tbl":
-            for row in el.findall(f".//{W_NS}tr"):
+            for row in doc.element.body.findall(f".//{W_NS}tr"):
                 cells = [_extract_text_from_el(c) for c in row.findall(f".//{W_NS}tc")]
                 if any(cells):
                     out.append(" | ".join(cells))
@@ -255,6 +330,7 @@ def _extract_text_or_none(resp) -> Optional[str]:
     except Exception:
         return None
 
+
 def _finish_reason(resp) -> Optional[int]:
     try:
         return int(resp.candidates[0].finish_reason)
@@ -263,9 +339,10 @@ def _finish_reason(resp) -> Optional[int]:
 
 
 # ============================================================
-# Image parsing (best-effort para SDK viejo)
+# Image parsing (best-effort)
 # ============================================================
 DATA_URI_RE = re.compile(r"data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\n\r]+)")
+
 
 def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
     if x is None:
@@ -287,6 +364,7 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
             except Exception:
                 return None
     return None
+
 
 def _extract_inline_bytes_or_none(resp) -> Optional[bytes]:
     try:
@@ -315,6 +393,7 @@ def _extract_inline_bytes_or_none(resp) -> Optional[bytes]:
     except Exception:
         return None
 
+
 def _looks_like_image(b: bytes) -> bool:
     if not b or len(b) < MIN_IMAGE_BYTES:
         return False
@@ -325,6 +404,7 @@ def _looks_like_image(b: bytes) -> bool:
     if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
         return True
     return False
+
 
 def generate_image_bytes(model_id: str, prompt_img: str) -> Optional[bytes]:
     if not model_id:
@@ -369,6 +449,7 @@ def list_models_generate_content() -> List[str]:
             continue
     return models
 
+
 def rank_text_models(models: List[str], prefer: str) -> List[str]:
     prefer = (prefer or "").strip()
     prios = []
@@ -400,6 +481,7 @@ def rank_text_models(models: List[str], prefer: str) -> List[str]:
             used.add(real)
     return ordered
 
+
 def smoke_test_text_model(model_id: str) -> Tuple[bool, str]:
     try:
         m = genai.GenerativeModel(model_id)
@@ -413,6 +495,7 @@ def smoke_test_text_model(model_id: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
+
 def smoke_test_image_model(model_id: str) -> Tuple[bool, str]:
     try:
         b = generate_image_bytes(model_id, IMAGE_PROMPT_PREFIX + "manzana")
@@ -421,6 +504,7 @@ def smoke_test_image_model(model_id: str) -> Tuple[bool, str]:
         return True, f"OK bytes={len(b)}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
 
 def pick_image_fallback(visible: List[str], prefer_img: str) -> Tuple[Optional[str], str]:
     cands = []
@@ -431,7 +515,7 @@ def pick_image_fallback(visible: List[str], prefer_img: str) -> Tuple[Optional[s
 
     for m in visible:
         ml = m.lower()
-        if "imagen" in ml or ml.startswith("models/imagen") or "image-generation" in ml:
+        if "imagen" in ml or ml.startswith("models/imagen") or "image-generation" in ml or "flash-image" in ml:
             cands.append(m)
 
     seen = set()
@@ -444,6 +528,7 @@ def pick_image_fallback(visible: List[str], prefer_img: str) -> Tuple[Optional[s
         if ok:
             return cand, f"OK {last_msg}"
     return None, f"FAIL {last_msg}"
+
 
 def boot_pick_models(prefer_text: str, prefer_image: str) -> Dict[str, Any]:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
@@ -474,6 +559,7 @@ def boot_pick_models(prefer_text: str, prefer_image: str) -> Dict[str, Any]:
         "boot_time": now_str(),
     }
 
+
 @st.cache_resource(show_spinner=False)
 def boot_cached(prefer_text: str, prefer_image: str) -> Dict[str, Any]:
     try:
@@ -483,14 +569,15 @@ def boot_cached(prefer_text: str, prefer_image: str) -> Dict[str, Any]:
 
 
 # ============================================================
-# JSON validation (v24.x) + repair
+# JSON validation + repair + parse fallback
 # ============================================================
 def _contains_markdown_markers(s: str) -> bool:
     if not s:
         return False
     return ("**" in s) or ("```" in s) or ("__" in s)
 
-def validate_activity_json_v241(data: Dict[str, Any]) -> Tuple[bool, str]:
+
+def validate_activity_json_v242(data: Dict[str, Any]) -> Tuple[bool, str]:
     try:
         if not isinstance(data, dict):
             return False, "Root no es objeto"
@@ -528,7 +615,7 @@ def validate_activity_json_v241(data: Dict[str, Any]) -> Tuple[bool, str]:
             en = str(it.get("enunciado", "")).strip()
             if not en:
                 return False, f"items[{i}].enunciado vacío"
-            if _contains_markdown_markers(en) or _contains_markdown_markers(str(it.get("pista_visual",""))):
+            if _contains_markdown_markers(en) or _contains_markdown_markers(str(it.get("pista_visual", ""))):
                 return False, f"items[{i}] contiene marcadores markdown"
             if not any(en.startswith(x) for x in ["✍️", "📖", "🔢", "🎨"]):
                 return False, f"items[{i}].enunciado no inicia con emoji"
@@ -556,9 +643,11 @@ def validate_activity_json_v241(data: Dict[str, Any]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Exception validando: {e}"
 
-def build_repair_prompt_v241(bad: str, why: str) -> str:
+
+def build_repair_prompt_v242(bad: str, why: str) -> str:
     return f"""
 Devuelve EXCLUSIVAMENTE un JSON válido y corregido (sin texto extra).
+No cambies el contenido pedagógico salvo lo necesario para cumplir el esquema y reglas.
 
 Problema detectado:
 {why}
@@ -568,14 +657,31 @@ JSON A CORREGIR:
 
 Reglas:
 - Prohibido markdown. NO usar ** ni backticks ni __.
+- TODAS las keys deben ir entre comillas dobles.
+- Sin trailing commas.
 - control_calidad.sin_markdown = true
 - control_calidad.items_count == len(items)
 - items[].enunciado inicia con emoji (✍️📖🔢🎨)
 - En vez de negritas, usar keywords_bold[].
 - visual.prompt inicia con "{IMAGE_PROMPT_PREFIX}" si visual.habilitado=true
 - tiempo_total_min = 60
-- El alumno NO debe ver sugerencias_docente ni adecuaciones_aplicadas (igual deben existir en JSON para el DOCENTE).
 """.strip()
+
+
+def build_parse_fix_prompt(raw: str, err: str) -> str:
+    return f"""
+Tu única tarea es convertir el siguiente texto en JSON válido.
+No agregues texto. No agregues comentarios.
+No cambies el contenido semántico, solo corrige sintaxis JSON.
+Reglas: keys con comillas dobles, sin trailing commas, valores string con comillas dobles.
+
+ERROR DE PARSEO:
+{err}
+
+TEXTO A CONVERTIR:
+{raw}
+""".strip()
+
 
 def generate_json_once(model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
     m = genai.GenerativeModel(model_id)
@@ -586,12 +692,13 @@ def generate_json_once(model_id: str, prompt: str, max_out: int) -> Dict[str, An
     if text is None:
         fr = _finish_reason(resp)
         raise ValueError(f"Empty candidate (finish_reason={fr})")
-    return json.loads(text)
+    return safe_json_loads(text)
 
-def generate_json_with_repair_v241(model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
+
+def generate_json_with_repair_v242(model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
     try:
         data = generate_json_once(model_id, prompt, max_out)
-        ok, why = validate_activity_json_v241(data)
+        ok, why = validate_activity_json_v242(data)
         if ok:
             return data
         raise ValueError(f"JSON inválido: {why}")
@@ -606,34 +713,59 @@ def generate_json_with_repair_v241(model_id: str, prompt: str, max_out: int) -> 
         if raw is None:
             raise ValueError(f"Empty candidate (finish_reason={fr})")
 
-        repair = build_repair_prompt_v241(raw, f"{type(e).__name__}: {e}")
+        # intento parse saneado
+        try:
+            data0 = safe_json_loads(raw)
+            ok0, _ = validate_activity_json_v242(data0)
+            if ok0:
+                return data0
+        except Exception as pe:
+            # parse-fix por el modelo (solo sintaxis)
+            fix_prompt = build_parse_fix_prompt(raw, f"{type(pe).__name__}: {pe}")
+            resp_fix = retry_with_backoff(lambda: m.generate_content(fix_prompt, generation_config=cfg, safety_settings=SAFETY_SETTINGS))
+            raw_fix = _extract_text_or_none(resp_fix)
+            fr_fix = _finish_reason(resp_fix)
+            if raw_fix is None:
+                raise ValueError(f"Empty candidate after parse-fix (finish_reason={fr_fix})")
+            try:
+                data_fix = safe_json_loads(raw_fix)
+                ok_fix, _ = validate_activity_json_v242(data_fix)
+                if ok_fix:
+                    return data_fix
+            except Exception:
+                pass
+
+        # repair por reglas
+        repair = build_repair_prompt_v242(raw, f"{type(e).__name__}: {e}")
         resp2 = retry_with_backoff(lambda: m.generate_content(repair, generation_config=cfg, safety_settings=SAFETY_SETTINGS))
         raw2 = _extract_text_or_none(resp2)
         fr2 = _finish_reason(resp2)
         if raw2 is None:
             raise ValueError(f"Empty candidate after repair (finish_reason={fr2})")
 
-        data2 = json.loads(raw2)
-        ok2, why2 = validate_activity_json_v241(data2)
+        data2 = safe_json_loads(raw2)
+        ok2, why2 = validate_activity_json_v242(data2)
         if not ok2:
             raise ValueError(f"JSON reparado inválido: {why2}")
         return data2
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def cached_generate_v241(cache_key: str, model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
-    return generate_json_with_repair_v241(model_id, prompt, max_out)
 
-def request_activity_ultra_v241(model_id: str, prompt_full: str, prompt_compact: str, cache_key: str) -> Tuple[Dict[str, Any], str, int]:
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def cached_generate_v242(cache_key: str, model_id: str, prompt: str, max_out: int) -> Dict[str, Any]:
+    return generate_json_with_repair_v242(model_id, prompt, max_out)
+
+
+def request_activity_ultra_v242(model_id: str, prompt_full: str, prompt_compact: str, cache_key: str) -> Tuple[Dict[str, Any], str, int]:
     last_err = None
     for t in OUT_TOKEN_STEPS_FULL:
         try:
-            data = cached_generate_v241(cache_key + f"::FULL::{t}", model_id, prompt_full, t)
+            data = cached_generate_v242(cache_key + f"::FULL::{t}", model_id, prompt_full, t)
             return data, "FULL", t
         except Exception as e:
             last_err = e
     for t in OUT_TOKEN_STEPS_COMPACT:
         try:
-            data = cached_generate_v241(cache_key + f"::COMPACT::{t}", model_id, prompt_compact, t)
+            data = cached_generate_v242(cache_key + f"::COMPACT::{t}", model_id, prompt_compact, t)
             return data, "COMPACT", t
         except Exception as e:
             last_err = e
@@ -661,10 +793,12 @@ def apply_card_style(cell, fill_hex: str = "FAFAFA"):
         tc_borders.append(edge)
     tc_pr.append(tc_borders)
 
+
 def clear_paragraph(paragraph):
     p = paragraph._p
     for child in list(p):
         p.remove(child)
+
 
 def add_text(paragraph, text: str, bold: bool = False, color: Optional[RGBColor] = None, size_pt: int = 14):
     run = paragraph.add_run(text)
@@ -675,6 +809,7 @@ def add_text(paragraph, text: str, bold: bool = False, color: Optional[RGBColor]
     if color is not None:
         run.font.color.rgb = color
     return run
+
 
 def add_text_with_keywords(paragraph, text: str, keywords: List[str], size_pt: int = 14):
     text = str(text or "")
@@ -693,6 +828,7 @@ def add_text_with_keywords(paragraph, text: str, keywords: List[str], size_pt: i
         else:
             add_text(paragraph, part, bold=False, size_pt=size_pt)
 
+
 def response_box(cell, label: str = "✍️ Respuesta:", lines: int = 4):
     t = cell.add_table(rows=1, cols=1)
     c = t.rows[0].cells[0]
@@ -707,11 +843,13 @@ def response_box(cell, label: str = "✍️ Respuesta:", lines: int = 4):
     p2.paragraph_format.line_spacing = 1.5
     add_text(p2, "\n" + ("\n" * max(0, lines - 1)) + " ", bold=False)
 
+
 def checkbox_list(cell, options: List[str], max_opts: int = 8):
     for opt in (options or [])[:max_opts]:
         p = cell.add_paragraph()
         p.paragraph_format.line_spacing = 1.5
         add_text(p, f"☐ {opt}", bold=False)
+
 
 def header_block(doc: Document, alumno: Dict[str, str], logo_b: Optional[bytes], title: str):
     style = doc.styles['Normal']
@@ -725,13 +863,13 @@ def header_block(doc: Document, alumno: Dict[str, str], logo_b: Optional[bytes],
             h.rows[0].cells[0].paragraphs[0].add_run().add_picture(io.BytesIO(logo_b), width=Inches(0.7))
         except Exception:
             pass
+
     info = h.rows[0].cells[1].paragraphs[0]
     info.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     add_text(info, title + "\n", bold=True, size_pt=12)
     add_text(info, f"{alumno.get('nombre','')}\n", bold=True, size_pt=11)
     add_text(info, f"{alumno.get('diagnostico','')}\n", bold=False, size_pt=11)
     add_text(info, f"Grupo: {alumno.get('grupo','')} | Grado: {alumno.get('grado','')}", bold=False, size_pt=11)
-
     doc.add_paragraph("")
 
 
@@ -739,19 +877,17 @@ def render_alumno_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Opt
     doc = Document()
     header_block(doc, alumno, logo_b, "FICHA DEL ALUMNO")
 
-    # Objetivo
     p = doc.add_paragraph()
     add_text(p, "Objetivo de aprendizaje", bold=True)
     p2 = doc.add_paragraph()
     p2.paragraph_format.line_spacing = 1.5
-    add_text(p2, str(data.get("objetivo_aprendizaje","")), bold=False)
+    add_text(p2, str(data.get("objetivo_aprendizaje", "")), bold=False)
 
     doc.add_paragraph("")
 
-    # Consigna general
     p = doc.add_paragraph()
     add_text(p, "Consigna general (paso a paso)", bold=True)
-    cg = str(data.get("consigna_general_alumno","")).strip()
+    cg = str(data.get("consigna_general_alumno", "")).strip()
     for line in [x.strip() for x in cg.split("\n") if x.strip()]:
         p3 = doc.add_paragraph()
         p3.paragraph_format.line_spacing = 1.5
@@ -759,18 +895,17 @@ def render_alumno_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Opt
 
     doc.add_paragraph("")
 
-    # Cards por ítem
     for idx, it in enumerate(data.get("items", []), start=1):
         if not isinstance(it, dict):
             continue
 
-        tipo = str(it.get("tipo","")).strip()
-        enunciado = ensure_action_emoji(tipo, str(it.get("enunciado","")).strip())
+        tipo = str(it.get("tipo", "")).strip()
+        enunciado = ensure_action_emoji(tipo, str(it.get("enunciado", "")).strip())
         pasos = it.get("pasos", []) if isinstance(it.get("pasos", []), list) else []
         opciones = it.get("opciones", []) if isinstance(it.get("opciones", []), list) else []
-        formato = str(it.get("respuesta_formato","texto_corto")).strip()
+        formato = str(it.get("respuesta_formato", "texto_corto")).strip()
         kw = it.get("keywords_bold", []) if isinstance(it.get("keywords_bold", []), list) else []
-        pista = str(it.get("pista_visual","")).strip()
+        pista = str(it.get("pista_visual", "")).strip()
 
         v = it.get("visual", {}) if isinstance(it.get("visual", {}), dict) else {}
         v_en = normalize_bool(v.get("habilitado", False))
@@ -782,24 +917,20 @@ def render_alumno_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Opt
         apply_card_style(cell, fill_hex="FAFAFA")
         clear_paragraph(cell.paragraphs[0])
 
-        # Título ítem
         pt = cell.add_paragraph()
         pt.paragraph_format.line_spacing = 1.5
         add_text(pt, f"Ítem {idx}", bold=True, size_pt=12)
 
-        # Consigna
         p_con = cell.add_paragraph()
         p_con.paragraph_format.line_spacing = 1.6
         add_text_with_keywords(p_con, enunciado, kw, size_pt=14)
 
-        # Pasos
         if pasos:
             for i, step in enumerate(pasos[:8], start=1):
                 ps = cell.add_paragraph()
                 ps.paragraph_format.line_spacing = 1.5
                 add_text(ps, f"{i}. {str(step)}", bold=False)
 
-        # Trabajo
         sep = cell.add_paragraph()
         add_text(sep, "Trabajo", bold=True, size_pt=12)
 
@@ -808,16 +939,15 @@ def render_alumno_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Opt
         else:
             response_box(cell, label="✍️ Respuesta:", lines=4)
 
-        # Pista (verde)
         if pista:
             pp = cell.add_paragraph()
             pp.paragraph_format.line_spacing = 1.5
             add_text(pp, "Pista", bold=True, size_pt=12)
+
             pp2 = cell.add_paragraph()
             pp2.paragraph_format.line_spacing = 1.5
             add_text(pp2, "💡 " + pista, bold=False, color=RGBColor(0, 150, 0), size_pt=14)
 
-        # Imagen por ítem (si existe)
         if enable_img and img_model_id and v_en and v_pr:
             img_bytes = generate_image_bytes(img_model_id, v_pr)
             if img_bytes:
@@ -841,19 +971,18 @@ def render_docente_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Op
     doc = Document()
     header_block(doc, alumno, logo_b, "SOLUCIONARIO DOCENTE")
 
-    # Resumen objetivo
     p = doc.add_paragraph()
     add_text(p, "Objetivo de aprendizaje", bold=True)
     p2 = doc.add_paragraph()
     p2.paragraph_format.line_spacing = 1.5
-    add_text(p2, str(data.get("objetivo_aprendizaje","")), bold=False)
+    add_text(p2, str(data.get("objetivo_aprendizaje", "")), bold=False)
 
     doc.add_paragraph("")
 
     sol = data.get("solucionario_docente", {}) if isinstance(data.get("solucionario_docente", {}), dict) else {}
     respuestas = sol.get("respuestas", []) if isinstance(sol.get("respuestas", []), list) else []
 
-    by_idx = {}
+    by_idx: Dict[int, Dict[str, Any]] = {}
     for r in respuestas:
         if not isinstance(r, dict):
             continue
@@ -864,7 +993,7 @@ def render_docente_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Op
         if not isinstance(it, dict):
             continue
 
-        en = str(it.get("enunciado","")).strip()
+        en = str(it.get("enunciado", "")).strip()
         r = by_idx.get(idx, {})
 
         card = doc.add_table(rows=1, cols=1)
@@ -884,7 +1013,7 @@ def render_docente_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Op
         pf = cell.add_paragraph()
         pf.paragraph_format.line_spacing = 1.5
         add_text(pf, "Respuesta final: ", bold=True)
-        add_text(pf, str(r.get("respuesta_final","(no provista)")), bold=False)
+        add_text(pf, str(r.get("respuesta_final", "(no provista)")), bold=False)
 
         des = r.get("desarrollo", []) if isinstance(r.get("desarrollo", []), list) else []
         if des:
@@ -915,7 +1044,6 @@ def render_docente_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Op
             p2.paragraph_format.line_spacing = 1.5
             add_text(p2, f"• {c}", bold=False)
 
-    # SOLO DOCENTE: Adecuaciones aplicadas + sugerencias
     adec = data.get("adecuaciones_aplicadas", []) if isinstance(data.get("adecuaciones_aplicadas", []), list) else []
     if adec:
         doc.add_paragraph("")
@@ -942,11 +1070,154 @@ def render_docente_docx(data: Dict[str, Any], alumno: Dict[str, str], logo_b: Op
 
 
 # ============================================================
+# Normalización defensiva (post-LLM)
+# ============================================================
+_ALLOWED_TIPOS = {
+    "calcular", "lectura", "escritura", "dibujar",
+    "multiple choice", "multiple_choice",
+    "unir", "completar", "verdadero_falso", "problema_guiado"
+}
+_ALLOWED_RESP_FMT = {"texto_corto", "procedimiento", "dibujo", "multiple_choice"}
+
+
+def _as_str_list(v: Any, max_items: int) -> List[str]:
+    if isinstance(v, list):
+        out = []
+        for x in v:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out[:max_items]
+    if v is None:
+        return []
+    s = str(v).strip()
+    return [s][:max_items] if s else []
+
+
+def normalize_activity_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    # root fields
+    data["objetivo_aprendizaje"] = str(data.get("objetivo_aprendizaje", "")).strip()
+    data["consigna_general_alumno"] = str(data.get("consigna_general_alumno", "")).strip()
+    data["tiempo_total_min"] = 60
+
+    # arrays root
+    data["adecuaciones_aplicadas"] = _as_str_list(data.get("adecuaciones_aplicadas", []), 30)
+    data["sugerencias_docente"] = _as_str_list(data.get("sugerencias_docente", []), 30)
+
+    # items
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        items = []
+    items_norm: List[Dict[str, Any]] = []
+
+    for it in items[:60]:
+        if not isinstance(it, dict):
+            continue
+
+        tipo = str(it.get("tipo", "")).strip()
+        tipo_l = tipo.lower()
+        if tipo_l not in _ALLOWED_TIPOS:
+            tipo = "lectura"
+            tipo_l = "lectura"
+
+        en = ensure_action_emoji(tipo_l, str(it.get("enunciado", "")).strip())
+
+        pasos = _as_str_list(it.get("pasos", []), 10)
+        opciones = _as_str_list(it.get("opciones", []), 12)
+
+        resp_fmt = str(it.get("respuesta_formato", "texto_corto")).strip()
+        if resp_fmt not in _ALLOWED_RESP_FMT:
+            # heuristic: si hay opciones -> multiple_choice
+            resp_fmt = "multiple_choice" if opciones else "texto_corto"
+
+        kw = _as_str_list(it.get("keywords_bold", []), 10)
+
+        pista = str(it.get("pista_visual", "")).strip()
+
+        v = it.get("visual", {})
+        if not isinstance(v, dict):
+            v = {}
+        v_en = normalize_bool(v.get("habilitado", False))
+        v_pr = str(v.get("prompt", "")).strip()
+        if v_en:
+            v_pr = normalize_visual_prompt(v_pr)
+            if not v_pr.startswith(IMAGE_PROMPT_PREFIX):
+                v_pr = IMAGE_PROMPT_PREFIX + "objeto"
+        else:
+            v_pr = ""
+
+        items_norm.append({
+            "tipo": tipo_l,
+            "enunciado": en,
+            "pasos": pasos,
+            "opciones": opciones,
+            "respuesta_formato": resp_fmt,
+            "keywords_bold": kw,
+            "pista_visual": pista,
+            "visual": {"habilitado": bool(v_en), "prompt": v_pr},
+        })
+
+    data["items"] = items_norm
+
+    # solucionario
+    sol = data.get("solucionario_docente", {})
+    if not isinstance(sol, dict):
+        sol = {}
+
+    resp_list = sol.get("respuestas", [])
+    if not isinstance(resp_list, list):
+        resp_list = []
+
+    resp_norm: List[Dict[str, Any]] = []
+    for r in resp_list[:120]:
+        if not isinstance(r, dict):
+            continue
+        try:
+            idx = int(r.get("item_index", 0) or 0)
+        except Exception:
+            idx = 0
+        if idx <= 0:
+            continue
+        resp_norm.append({
+            "item_index": idx,
+            "respuesta_final": str(r.get("respuesta_final", "")).strip() or "(no provista)",
+            "desarrollo": _as_str_list(r.get("desarrollo", []), 20),
+            "errores_frecuentes": _as_str_list(r.get("errores_frecuentes", []), 20),
+        })
+
+    sol["respuestas"] = resp_norm
+    sol["criterios_correccion"] = _as_str_list(sol.get("criterios_correccion", []), 30)
+    data["solucionario_docente"] = sol
+
+    # control_calidad
+    cc = data.get("control_calidad", {})
+    if not isinstance(cc, dict):
+        cc = {}
+    cc["items_count"] = len(items_norm)
+    cc["sin_markdown"] = True
+    if "incluye_ejemplo" not in cc:
+        cc["incluye_ejemplo"] = True
+    if "lenguaje_concreto" not in cc:
+        cc["lenguaje_concreto"] = True
+    if "una_accion_por_frase" not in cc:
+        cc["una_accion_por_frase"] = True
+    data["control_calidad"] = cc
+
+    return data
+
+
+def build_summary_line(n: str, g: str, d: str, items_count: int, img_on: bool, mode_used: str, max_t: int) -> str:
+    return f"- {n} | Grupo={g} | Diag={d} | items={items_count} | img={'ON' if img_on else 'OFF'} | gen={mode_used}@{max_t}"
+
+
+# ============================================================
 # UI + Proceso
 # ============================================================
 def main():
-    st.title("Nano Opal v24.1 🧠🍌")
-    st.caption("Alumno NO ve sugerencias/adecuaciones. Eso va al Solucionario DOCENTE. Imágenes OK.")
+    st.title("Nano Opal v24.2 🧠🍌")
+    st.caption("JSON blindado + parse-fix/repair. Alumno NO ve sugerencias/adecuaciones. ZIP con DOCX alumno + docente.")
 
     try:
         df = pd.read_csv(URL_PLANILLA)
@@ -982,21 +1253,18 @@ def main():
 
         CONFIG = boot_cached(prefer_txt, prefer_img)
         st.write(f"Boot: {CONFIG.get('boot_time')}")
+
         if CONFIG.get("txt"):
             st.success(f"Texto: {CONFIG.get('txt')}")
         else:
             st.error("Texto: N/A")
-        st.caption(CONFIG.get("txt_reason",""))
+        st.caption(CONFIG.get("txt_reason", ""))
 
         if CONFIG.get("img"):
             st.success(f"Imagen: {CONFIG.get('img')}")
         else:
             st.warning("Imagen: desactivada (SDK/modelo no entregó bytes)")
-        st.caption(CONFIG.get("img_reason",""))
-
-        with st.expander("Modelos visibles (generateContent)", expanded=False):
-            for m in (CONFIG.get("visible", []) or []):
-                st.write(m)
+        st.caption(CONFIG.get("img_reason", ""))
 
         st.divider()
 
@@ -1020,6 +1288,10 @@ def main():
 
         st.divider()
         inst_style = st.text_area("Instrucciones de Estilo On-the-fly", height=120)
+
+        st.divider()
+        st.caption("Debug")
+        debug_save_json = st.checkbox("Guardar JSON por alumno en ZIP", value=True)
 
     if not CONFIG.get("txt"):
         st.error("No hay modelo de texto funcional.")
@@ -1085,11 +1357,11 @@ def main():
             return
 
         zip_io = io.BytesIO()
-        logs = []
-        errors = []
+        errors: List[str] = []
         ok_count = 0
 
-        logs.append("Nano Opal v24.1")
+        logs = []
+        logs.append("Nano Opal v24.2")
         logs.append(f"Inicio: {now_str()}")
         logs.append(f"Modo: {mode}")
         logs.append(f"Modelo texto: {CONFIG.get('txt')}")
@@ -1099,13 +1371,20 @@ def main():
         logs.append(f"Alumnos: {len(df_final)}")
         logs.append("")
 
+        resumen_lines: List[str] = []
+        resumen_lines.append("RESUMEN - Nano Opal v24.2")
+        resumen_lines.append(f"Inicio: {now_str()}")
+        resumen_lines.append(f"Modo: {mode}")
+        resumen_lines.append(f"Grado: {grado}")
+        resumen_lines.append("")
+
         with zipfile.ZipFile(zip_io, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("_REPORTE.txt", "\n".join(logs))
 
             prog = st.progress(0.0)
             status = st.empty()
 
-            base_hash = hash_text(f"{mode}|{grado}|{input_text}|{inst_style}|{SYSTEM_PROMPT_OPAL_V241}|{CONFIG.get('txt')}")
+            base_hash = hash_text(f"{mode}|{grado}|{input_text}|{inst_style}|{SYSTEM_PROMPT_OPAL_V242}|{CONFIG.get('txt')}")
 
             for idx, (_, row) in enumerate(df_final.iterrows(), start=1):
                 n = str(row[alumno_col]).strip()
@@ -1120,7 +1399,7 @@ def main():
                     else:
                         ctx = f"ADAPTAR CONTENIDO ORIGINAL:\n{input_text}\n"
 
-                    prompt_full = f"""{SYSTEM_PROMPT_OPAL_V241}
+                    prompt_full = f"""{SYSTEM_PROMPT_OPAL_V242}
 
 INSTRUCCIONES ON-THE-FLY (prioridad alta):
 {inst_style}
@@ -1137,7 +1416,7 @@ ALUMNO (planilla):
 NOTAS:
 - NO usar markdown. NO usar ** en ningún campo.
 - La ficha del alumno NO debe incluir sugerencias_docente ni adecuaciones_aplicadas; esas son SOLO para el solucionario.
-"""
+""".strip()
 
                     prompt_compact = f"""Devuelve SOLO JSON válido del esquema.
 Max 6 items. Sin markdown. keywords_bold[] corto. visual.habilitado=true con prompt ARASAAC.
@@ -1150,80 +1429,70 @@ CONTEXTO:
 {ctx}
 
 ALUMNO: {n} | {d} | Grupo {g} | Grado {grado}
-"""
+""".strip()
 
                     cache_key = f"{base_hash}::{safe_filename(n)}::{safe_filename(g)}::{safe_filename(d)}"
-                    data, mode_used, max_t = request_activity_ultra_v241(CONFIG["txt"], prompt_full, prompt_compact, cache_key)
+                    data, mode_used, max_t = request_activity_ultra_v242(CONFIG["txt"], prompt_full, prompt_compact, cache_key)
 
-                    data["tiempo_total_min"] = 60
+                    # normalización dura + revalidación
+                    data = normalize_activity_payload(data)
+                    ok_json, why_json = validate_activity_json_v242(data)
+                    if not ok_json:
+                        raise ValueError(f"Post-normalize inválido: {why_json}")
 
-                    items_norm = []
-                    for it in (data.get("items", []) or []):
-                        if not isinstance(it, dict):
-                            continue
-                        tipo_i = str(it.get("tipo", "")).strip()
-                        en_i = ensure_action_emoji(tipo_i, str(it.get("enunciado", "")).strip())
-                        pasos = it.get("pasos", []) if isinstance(it.get("pasos", []), list) else []
-                        ops = it.get("opciones", []) if isinstance(it.get("opciones", []), list) else []
-                        rf = str(it.get("respuesta_formato", "texto_corto")).strip()
-                        kw = it.get("keywords_bold", []) if isinstance(it.get("keywords_bold", []), list) else []
-                        pista = str(it.get("pista_visual", "")).strip()
+                    alumno_meta = {"nombre": n, "diagnostico": d, "grupo": g, "grado": str(grado)}
 
-                        v = it.get("visual", {}) if isinstance(it.get("visual", {}), dict) else {}
-                        v_en = normalize_bool(v.get("habilitado", False))
-                        v_pr = normalize_visual_prompt(str(v.get("prompt", "")).strip()) if v_en else ""
+                    alumno_docx_b = render_alumno_docx(
+                        data=data,
+                        alumno=alumno_meta,
+                        logo_b=l_bytes,
+                        img_model_id=CONFIG.get("img"),
+                        enable_img=enable_img
+                    )
+                    docente_docx_b = render_docente_docx(
+                        data=data,
+                        alumno=alumno_meta,
+                        logo_b=l_bytes
+                    )
 
-                        items_norm.append({
-                            "tipo": tipo_i,
-                            "enunciado": en_i,
-                            "pasos": [str(x) for x in pasos[:10]],
-                            "opciones": [str(x) for x in ops[:10]],
-                            "respuesta_formato": rf,
-                            "keywords_bold": [str(x) for x in kw[:12]],
-                            "pista_visual": pista,
-                            "visual": {"habilitado": v_en, "prompt": v_pr}
-                        })
-                    data["items"] = items_norm
+                    base_name = safe_filename(f"{n}__{g}__{grado}")
+                    zf.writestr(f"{base_name}__ALUMNO.docx", alumno_docx_b)
+                    zf.writestr(f"{base_name}__DOCENTE.docx", docente_docx_b)
 
-                    data.setdefault("control_calidad", {})
-                    if isinstance(data["control_calidad"], dict):
-                        data["control_calidad"]["items_count"] = len(data["items"])
-                        data["control_calidad"]["sin_markdown"] = True
+                    if debug_save_json:
+                        zf.writestr(f"{base_name}__DATA.json", json.dumps(data, ensure_ascii=False, indent=2))
 
-                    okj, whyj = validate_activity_json_v241(data)
-                    if not okj:
-                        raise ValueError(f"JSON final inválido: {whyj}")
-
-                    alumno = {"nombre": n, "diagnostico": d, "grupo": g, "grado": str(grado)}
-
-                    doc_alumno = render_alumno_docx(data, alumno, l_bytes, CONFIG.get("img"), enable_img=enable_img)
-                    doc_docente = render_docente_docx(data, alumno, l_bytes)
-
-                    zf.writestr(f"Ficha_ALUMNO_{safe_filename(n)}.docx", doc_alumno)
-                    zf.writestr(f"Solucionario_DOCENTE_{safe_filename(n)}.docx", doc_docente)
-                    zf.writestr(f"_META_{safe_filename(n)}.txt", f"mode={mode_used}\nmax_tokens={max_t}\nitems={len(data.get('items',[]))}\nimg_enabled={enable_img}\nimg_model={CONFIG.get('img')}\n")
                     ok_count += 1
+                    resumen_lines.append(build_summary_line(n, g, d, len(data.get("items", [])), enable_img, mode_used, max_t))
 
                 except Exception as e:
-                    msg = f"{n} :: {type(e).__name__} :: {e}"
-                    errors.append(msg)
-                    zf.writestr(f"ERROR_{safe_filename(n)}.txt", msg)
+                    err = f"{n} | ERROR: {type(e).__name__}: {e}"
+                    errors.append(err)
+                    resumen_lines.append(f"- {n} | ERROR {type(e).__name__}: {e}")
 
-                prog.progress(idx / len(df_final))
+                prog.progress(min(1.0, idx / max(1, len(df_final))))
 
-            resumen = []
-            resumen.append("RESUMEN")
-            resumen.append(f"Fin: {now_str()}")
-            resumen.append(f"OK: {ok_count} / {len(df_final)}")
-            resumen.append(f"Errores: {len(errors)}")
+            resumen_lines.append("")
+            resumen_lines.append(f"OK: {ok_count}/{len(df_final)}")
             if errors:
-                resumen.append("")
-                resumen.append("ERRORES (primeros 200):")
-                resumen.extend([f"- {e}" for e in errors[:200]])
-            zf.writestr("_RESUMEN.txt", "\n".join(resumen))
+                resumen_lines.append(f"Errores: {len(errors)}")
+                resumen_lines.append("")
+                resumen_lines.extend(errors[:200])
 
-        st.success(f"Lote finalizado. OK: {ok_count} | Errores: {len(errors)}")
-        st.download_button("📥 Descargar ZIP", zip_io.getvalue(), "nano_opal_v24_1.zip", mime="application/zip")
+            zf.writestr("_RESUMEN.txt", "\n".join(resumen_lines))
+
+        status.success(f"Listo. OK={ok_count} | Errores={len(errors)}")
+
+        zip_io.seek(0)
+        st.download_button(
+            "⬇️ Descargar ZIP",
+            data=zip_io.getvalue(),
+            file_name=f"NanoOpal_v24_2_{safe_filename(grado)}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip"
+        )
+
+        with st.expander("Resumen", expanded=True):
+            st.text("\n".join(resumen_lines[:2400]))
 
 
 if __name__ == "__main__":
