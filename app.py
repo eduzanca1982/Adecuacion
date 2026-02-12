@@ -6,291 +6,158 @@ import zipfile
 import time
 import random
 import hashlib
+import base64
 import re
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+# 
 
 # ============================================================
-# Nano Opal HTML v26.0 (SIMPLE + ESTABLE)
-# - Modelo fijo: gemini-2.5-flash
-# - Output: HTML completo generado por IA
-# - Visuales: SVG inline (sin generación externa)
-# - UI mínima
-# - Sin APIs privadas de Streamlit
-# - Sin PDF
-# - Sin lógica híbrida
+# 1. CONFIGURACIÓN Y ESTILOS UI
 # ============================================================
+st.set_page_config(page_title="Nano Opal v25.2", layout="wide", page_icon="🧠")
 
-st.set_page_config(page_title="Nano Opal HTML v26.0", layout="wide")
-
-TEXT_MODEL = "models/gemini-2.5-flash"
+# Inyección de CSS para limpiar la interfaz de Streamlit
+st.markdown("""
+    <style>
+    .stButton>button { width: 100%; border-radius: 12px; height: 3.5em; background-color: #7C3AED; color: white; font-weight: bold; }
+    .stTextArea textarea { border-radius: 12px; border: 1px solid #E5E7EB; }
+    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
+    .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #F9FAFB; border-radius: 8px 8px 0 0; gap: 1px; }
+    .stTabs [aria-selected="true"] { background-color: #FFFFFF; border-bottom: 2px solid #7C3AED !format; }
+    </style>
+    """, unsafe_allow_html=True)
 
 SHEET_ID = "1dCZdGmK765ceVwTqXzEAJCrdSvdNLBw7t3q5Cq1Qrww"
 URL_PLANILLA = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
+TEXT_MODEL_ID = "models/gemini-2.5-flash"
 
-RETRIES = 4
-MIN_HTML_CHARS = 2000
-
-SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-]
-
-GEN_CFG = {
-    "temperature": 0.4,
-    "top_p": 0.9,
-    "top_k": 40,
-    "max_output_tokens": 8192,
+# ============================================================
+# 2. TEMAS Y DISEÑO VISUAL (SISTEMA DE TOKENS)
+# ============================================================
+THEMES = {
+    "Opal Clean (Dark)": {"bg": "#0B1020", "paper": "#0F172A", "card": "#111C35", "ink": "#EAF0FF", "muted": "#A8B3D6", "accent": "#7C3AED", "good": "#22C55E", "line": "rgba(255,255,255,0.1)"},
+    "Paper Bright (Light)": {"bg": "#F4F6FB", "paper": "#FFFFFF", "card": "#F8FAFF", "ink": "#0B1220", "muted": "#42526E", "accent": "#2563EB", "good": "#16A34A", "line": "rgba(15,23,42,0.1)"}
 }
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+def build_css_v25(theme_name):
+    t = THEMES[theme_name]
+    return f"""
+    :root {{
+        --bg: {t['bg']}; --paper: {t['paper']}; --card: {t['card']};
+        --ink: {t['ink']}; --muted: {t['muted']}; --accent: {t['accent']};
+        --good: {t['good']}; --line: {t['line']};
+    }}
+    body {{ background: var(--bg); color: var(--ink); font-family: Verdana, sans-serif; margin: 0; padding: 20px; }}
+    .paper {{ background: var(--paper); max-width: 850px; margin: auto; padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); border: 1px solid var(--line); }}
+    .card {{ background: var(--card); border: 1px solid var(--line); padding: 20px; border-radius: 15px; margin-bottom: 20px; page-break-inside: avoid; }}
+    .pista {{ border-left: 5px solid var(--good); background: rgba(34,197,94,0.1); padding: 15px; border-radius: 8px; font-style: italic; }}
+    .imgbox {{ background: rgba(255,255,255,0.05); border: 1px dashed var(--line); border-radius: 10px; padding: 10px; text-align: center; min-height: 100px; }}
+    h1 {{ color: var(--accent); font-size: 24px; }}
+    .badge {{ display: inline-block; padding: 4px 12px; background: var(--accent); color: white; border-radius: 99px; font-size: 12px; font-weight: bold; }}
+    """
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# 
 
-def hash_text(t):
-    return hashlib.sha256(t.encode("utf-8")).hexdigest()[:10]
-
-def safe_filename(name):
-    s = str(name).replace(" ", "_")
-    for ch in ["/","\\",":","*","?","\"","<",">","|"]:
-        s = s.replace(ch,"_")
-    return s[:120]
-
-def retry_with_backoff(fn):
-    last = None
-    for i in range(RETRIES):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(min((2**i)+random.random(), 10))
-    raise last
-
-def extract_text(resp):
-    try:
-        cand = resp.candidates[0]
-        content = cand.content
-        parts = content.parts
-        out = ""
-        for p in parts:
-            if hasattr(p, "text") and p.text:
-                out += p.text
-        return out.strip()
-    except Exception:
-        return ""
-
-def looks_like_html(s):
-    if not s:
-        return False
-    s2 = s.lower()
-    return "<html" in s2 and "</html>" in s2
-
-def ensure_html(s):
-    if not s:
-        return ""
+# ============================================================
+# 3. LÓGICA DE GENERACIÓN (BLINDADA)
+# ============================================================
+def clean_ai_html(raw):
+    s = re.sub(r'```html\s*', '', raw, flags=re.IGNORECASE)
+    s = re.sub(r'```', '', s)
     start = s.lower().find("<!doctype")
-    if start == -1:
-        start = s.lower().find("<html")
-    if start != -1:
-        s = s[start:]
-    if "</html>" not in s.lower():
-        s += "\n</html>"
-    return s
+    if start == -1: start = s.lower().find("<html")
+    return s[start:].strip() if start != -1 else s.strip()
 
-# ------------------------------------------------------------
-# Prompt Builders
-# ------------------------------------------------------------
-
-def build_student_prompt(source_text, alumno, grado):
+def build_student_prompt(brief, alumno, grado, visual_mode):
     return f"""
-Devuelve UN SOLO documento HTML completo (incluye <!doctype html> ... </html>).
-Prohibido markdown.
-Nada fuera del HTML.
+    Eres un experto en educación inclusiva. Genera una ficha HTML completa.
+    ALUMNO: {alumno['nombre']} (Grado: {grado}, Grupo: {alumno['grupo']})
+    PERFIL DE APRENDIZAJE: {alumno['perfil']}
+    
+    MODO VISUAL: {'Genera un SVG simple' if visual_mode == 'SVG' else 'Crea un placeholder <div class="imgbox">'}
+    
+    ESTRUCTURA:
+    1. Header profesional con datos del alumno.
+    2. Objetivo del día.
+    3. 8 ítems en formato .card: Cada uno con icono (✍️, 📖, 🔢), consigna clara y una PISTA VERDE (💡) que sea un micro-paso de acción.
+    
+    CONTENIDO BASE: {brief}
+    Responde SOLO con código HTML.
+    """
 
-Objetivo:
-Ficha visual de 60 minutos, estilo moderno tipo cards.
-Neuroinclusiva (TDAH/dislexia friendly).
-Micro pasos concretos.
-Carga cognitiva controlada.
-
-Cada card debe incluir:
-- Encabezado: "Ítem N"
-- Emoji inicial (✍️📖🔢🎨)
-- 2-6 pasos concretos
-- Zona Trabajo (caja de respuesta o checkboxes)
-- Pista concreta
-- Un SVG inline simple dentro de <div class="imgbox">...</div>
-
-Alumno:
-Nombre: {alumno["nombre"]}
-Grupo: {alumno["grupo"]}
-Grado: {grado}
-Perfil de aprendizaje: {alumno["perfil"]}
-
-Contenido base:
-{source_text}
-
-Salida: HTML completo.
-"""
-
-def build_teacher_prompt(student_html, alumno, grado):
-    return f"""
-Devuelve UN SOLO documento HTML completo.
-Prohibido markdown.
-Nada fuera del HTML.
-
-Objetivo:
-Solucionario docente alineado con los mismos ítems del alumno.
-
-Debe incluir:
-- Respuesta final por ítem
-- Desarrollo breve
-- Errores frecuentes
-- Adecuaciones aplicadas
-- Criterios de corrección
-
-Alumno:
-Nombre: {alumno["nombre"]}
-Grupo: {alumno["grupo"]}
-Grado: {grado}
-Perfil: {alumno["perfil"]}
-
-HTML del alumno:
-{student_html}
-
-Salida: HTML completo.
-"""
-
-# ------------------------------------------------------------
-# Core
-# ------------------------------------------------------------
-
-def generate_html(prompt):
-    m = genai.GenerativeModel(TEXT_MODEL)
-    resp = retry_with_backoff(
-        lambda: m.generate_content(prompt, generation_config=GEN_CFG, safety_settings=SAFETY_SETTINGS)
-    )
-    txt = extract_text(resp)
-    html = ensure_html(txt)
-    return html
-
-def robust_generate(prompt):
-    html = generate_html(prompt)
-    if looks_like_html(html) and len(html) > MIN_HTML_CHARS:
-        return html
-    # retry más fuerte
-    prompt2 = prompt + "\nLa salida anterior fue incompleta. Devuelve HTML largo y completo.\n"
-    html2 = generate_html(prompt2)
-    return html2
-
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
-
+# ============================================================
+# 4. APP PRINCIPAL
+# ============================================================
 def main():
-
-    st.title("Nano Opal HTML v26.0")
-    st.caption("Interfaz simple · HTML consistente · SVG inline · Modelo fijo")
-
     try:
         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-    except Exception as e:
-        st.error(f"API KEY error: {e}")
-        return
-
-    try:
         df = pd.read_csv(URL_PLANILLA)
         df.columns = [c.strip() for c in df.columns]
     except Exception as e:
-        st.error(f"Error cargando planilla: {e}")
-        return
+        st.error(f"Error de inicio: {e}"); return
 
-    grado_col = df.columns[1]
-    alumno_col = df.columns[2]
-    grupo_col = df.columns[3]
-    perfil_col = df.columns[4]
-
+    # --- SIDEBAR (Configuración) ---
     with st.sidebar:
-        grado = st.selectbox("Grado", sorted(df[grado_col].dropna().unique()))
-        df_f = df[df[grado_col] == grado]
+        st.header("Configuración")
+        grado = st.selectbox("Elegir Grado", sorted(df.iloc[:, 1].dropna().unique()))
+        df_f = df[df.iloc[:, 1] == grado]
+        
+        alcance = st.radio("Alcance", ["Todo el grado", "Seleccionar alumnos"])
+        alumnos_final = df_f if alcance == "Todo el grado" else df_f[df_f.iloc[:, 2].isin(st.multiselect("Alumnos", df_f.iloc[:, 2].unique()))]
+        
+        st.divider()
+        tema_ui = st.selectbox("Tema Visual", list(THEMES.keys()))
+        visual_mode = st.selectbox("Modo de Imágenes", ["SVG (IA Dibuja)", "Placeholder"])
+        logo = st.file_uploader("Logo Colegio", type=["png", "jpg"])
+        l_bytes = base64.b64encode(logo.read()).decode() if logo else ""
 
-        alumnos = st.multiselect("Alumnos", sorted(df_f[alumno_col].dropna().unique()))
-        if alumnos:
-            df_final = df_f[df_f[alumno_col].isin(alumnos)]
-        else:
-            df_final = df_f
+    # --- CUERPO (Trabajo) ---
+    st.title("Nano Opal v25.2")
+    
+    tab1, tab2 = st.tabs(["✨ Crear desde Idea", "🔄 Adaptar DOCX/Texto"])
+    
+    with tab1:
+        brief = st.text_area("¿Qué actividad necesitas hoy?", height=200, placeholder="Ej: Sumas y restas con temática de dinosaurios para 2do grado...")
+    
+    with tab2:
+        source_doc = st.text_area("Pega aquí el texto del examen original:", height=200)
 
-    with st.form("form_main"):
-        brief = st.text_area(
-            "Prompt / Contenido base",
-            height=250,
-            placeholder="Ej: Actividad de 60 minutos sobre proporcionalidad directa..."
-        )
-        submitted = st.form_submit_button("Generar lote")
+    # 
 
-    if not submitted:
-        return
+    if st.button("🚀 GENERAR LOTE DE FICHAS"):
+        content = brief if brief else source_doc
+        if not content: st.warning("Ingresa contenido."); return
 
-    if not brief.strip():
-        st.error("Contenido vacío.")
-        return
+        zip_io = io.BytesIO()
+        with zipfile.ZipFile(zip_io, "w") as zf:
+            prog = st.progress(0.0)
+            status = st.empty()
+            css_base = build_css_v25(tema_ui)
+            
+            for i, (_, row) in enumerate(alumnos_final.iterrows()):
+                nombre, grupo, perfil = str(row.iloc[2]), str(row.iloc[3]), str(row.iloc[4])
+                status.info(f"Generando para {nombre}...")
+                
+                try:
+                    m = genai.GenerativeModel(TEXT_MODEL_ID)
+                    p = build_student_prompt(content, {"nombre": nombre, "grupo": grupo, "perfil": perfil}, grado, visual_mode)
+                    res = m.generate_content(p, generation_config={"temperature": 0.4, "max_output_tokens": 8000})
+                    
+                    html_raw = clean_ai_html(res.text)
+                    # Inyección de CSS y Logo
+                    html_final = f"<html><head><style>{css_base}</style></head><body><div class='paper'>"
+                    if l_bytes: html_final += f"<img src='data:image/png;base64,{l_bytes}' style='height:60px; float:right;'>"
+                    html_final += f"{html_raw}</div></body></html>"
+                    
+                    zf.writestr(f"Ficha_{nombre.replace(' ', '_')}.html", html_final)
+                except Exception as e:
+                    zf.writestr(f"ERROR_{nombre}.txt", str(e))
+                prog.progress((i + 1) / len(alumnos_final))
 
-    if len(df_final) == 0:
-        st.error("No hay alumnos seleccionados.")
-        return
-
-    run_id = hash_text(now_str() + brief)
-
-    zip_io = io.BytesIO()
-    ok = 0
-    err = 0
-
-    with zipfile.ZipFile(zip_io, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-
-        for i, (_, row) in enumerate(df_final.iterrows(), start=1):
-            nombre = str(row[alumno_col])
-            grupo = str(row[grupo_col])
-            perfil = str(row[perfil_col])
-
-            alumno = {
-                "nombre": nombre,
-                "grupo": grupo,
-                "perfil": perfil
-            }
-
-            try:
-                st.write(f"Generando: {nombre}")
-
-                p_student = build_student_prompt(brief, alumno, grado)
-                student_html = robust_generate(p_student)
-
-                p_teacher = build_teacher_prompt(student_html, alumno, grado)
-                teacher_html = robust_generate(p_teacher)
-
-                base = safe_filename(f"{grado}_{grupo}_{nombre}")
-
-                zf.writestr(f"{base}__ALUMNO.html", student_html)
-                zf.writestr(f"{base}__DOCENTE.html", teacher_html)
-
-                ok += 1
-
-            except Exception as e:
-                err += 1
-                zf.writestr(f"ERROR_{safe_filename(nombre)}.txt", str(e))
-
-    st.success(f"Proceso finalizado. OK={ok} | Errores={err}")
-
-    st.download_button(
-        "Descargar ZIP",
-        data=zip_io.getvalue(),
-        file_name=f"NanoOpal_{grado}_{run_id}.zip",
-        mime="application/zip",
-        use_container_width=True
-    )
+        st.success("¡Lote listo!")
+        st.download_button("📥 Descargar ZIP", zip_io.getvalue(), f"Opal_{grado}.zip", "application/zip")
 
 if __name__ == "__main__":
     main()
