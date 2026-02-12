@@ -1,26 +1,6 @@
 streamlit
-google-generativeai
-python-docx
-pandas
-gspread
-PyPDF2
-pillow
-pydantic
-
-
-# --- Núcleo de la Aplicación ---
-streamlit
 pandas
 google-generativeai
-
-# --- Manejo de Documentos ---
 python-docx
 beautifulsoup4
-
-# --- Generación de PDF (Opcional pero recomendado) ---
-# Nota: Si el servidor no tiene pango/cairo, WeasyPrint fallará silenciosamente.
 weasyprint
-
-# --- Utilidades ---
-requests
-Pillow
