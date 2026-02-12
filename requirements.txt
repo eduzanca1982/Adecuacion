@@ -4,3 +4,4 @@ google-generativeai
 python-docx
 beautifulsoup4
 weasyprint
+pillow
