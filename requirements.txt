@@ -6,3 +6,9 @@ beautifulsoup4
 weasyprint
 pillow
 reportlab
+
+streamlit>=1.33
+pandas>=2.0
+google-generativeai>=0.7.2
+weasyprint>=62.0
+reportlab>=4.0
